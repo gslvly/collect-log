@@ -1,0 +1,51 @@
+import { describe, expect, it } from 'vitest';
+
+import { ERROR_CODES, ERROR_HTTP_STATUS } from './errors.js';
+
+describe('ERROR_HTTP_STATUS', () => {
+  it('exhaustively matches DESIGN 8.3 plus the route-level 404 and 415', () => {
+    const expected = {
+      INVALID_JSON: 400,
+      INVALID_ENVELOPE: 400,
+      INVALID_TABLE_ID: 400,
+      INVALID_RECORD_ID: 400,
+      INVALID_OCCURRED_AT: 400,
+      UNKNOWN_FIELD: 400,
+      DEPRECATED_FIELD: 400,
+      REQUIRED_FIELD_MISSING: 400,
+      INVALID_FIELD_TYPE: 400,
+      FIELD_VALUE_TOO_LONG: 400,
+      TOO_MANY_FIELDS: 400,
+      INVALID_QUERY: 400,
+      CONFIRMATION_REQUIRED: 400,
+      INVALID_SIGNATURE: 401,
+      SIGNATURE_EXPIRED: 401,
+      REPLAYED_NONCE: 401,
+      UNAUTHORIZED: 401,
+      TOKEN_EXPIRED: 401,
+      INVALID_CREDENTIALS: 401,
+      INVALID_CAPTCHA: 401,
+      FORBIDDEN: 403,
+      TABLE_DISABLED: 403,
+      TABLE_NOT_FOUND: 404,
+      FIELD_NOT_FOUND: 404,
+      USER_NOT_FOUND: 404,
+      ROUTE_NOT_FOUND: 404,
+      USERNAME_EXISTS: 409,
+      FIELD_KEY_EXISTS: 409,
+      FIELD_KEY_RETIRED: 409,
+      TABLE_STATE_CONFLICT: 409,
+      LAST_SUPER_ADMIN: 409,
+      PAYLOAD_TOO_LARGE: 413,
+      UNSUPPORTED_MEDIA_TYPE: 415,
+      RATE_LIMITED: 429,
+      INTERNAL_ERROR: 500,
+      INSERT_FAILED: 500,
+      TABLE_NOT_READY: 503,
+      CLICKHOUSE_UNAVAILABLE: 503,
+    } as const;
+
+    expect(ERROR_CODES).toEqual(Object.keys(expected));
+    expect(ERROR_HTTP_STATUS).toEqual(expected);
+  });
+});

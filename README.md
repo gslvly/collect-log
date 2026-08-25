@@ -16,3 +16,76 @@
 
 完整设计见 [DESIGN.md](./DESIGN.md)。
 
+## 本地启动
+
+### 1. 启动 ClickHouse
+
+本项目只使用 ClickHouse。下面的命令会启动名为 `log-ch` 的本地容器，HTTP 端口为
+`8123`，管理员账户为 `default / devpass`：
+
+```bash
+docker run -d \
+  --name log-ch \
+  --ulimit nofile=262144:262144 \
+  -p 8123:8123 \
+  -p 9000:9000 \
+  -e CLICKHOUSE_PASSWORD=devpass \
+  clickhouse/clickhouse-server:latest
+```
+
+### 2. 创建数据库和三个业务账户
+
+三个账户的权限严格分离：`ch_ingest` 只能写业务数据，`ch_meta` 负责元数据和 DDL，
+`ch_readonly` 只能查询。`async_insert` 不配置到账户 profile，只会在后续上报请求中作为
+query-level setting 使用。
+
+```bash
+docker exec -i log-ch clickhouse-client \
+  --user default \
+  --password devpass \
+  --multiquery <<'SQL'
+CREATE DATABASE IF NOT EXISTS meta;
+CREATE DATABASE IF NOT EXISTS data;
+
+CREATE USER IF NOT EXISTS ch_ingest IDENTIFIED WITH sha256_password BY 'ingest_pw';
+CREATE USER IF NOT EXISTS ch_meta IDENTIFIED WITH sha256_password BY 'meta_pw';
+CREATE USER IF NOT EXISTS ch_readonly IDENTIFIED WITH sha256_password BY 'readonly_pw';
+
+GRANT INSERT ON data.* TO ch_ingest;
+
+GRANT CREATE DATABASE ON *.* TO ch_meta;
+GRANT ALL ON meta.* TO ch_meta;
+GRANT SELECT, ALTER, CREATE TABLE, DROP TABLE ON data.* TO ch_meta;
+GRANT SELECT ON system.* TO ch_meta;
+
+GRANT SELECT ON meta.* TO ch_readonly;
+GRANT SELECT ON data.* TO ch_readonly;
+SQL
+```
+
+### 3. 安装并启动
+
+需要 Node.js 当前 LTS 和 pnpm。复制本地配置后即可同时启动 server 与空白 web 骨架：
+
+```bash
+pnpm i
+cp packages/server/.env.example packages/server/.env
+pnpm dev
+```
+
+- server：`http://localhost:3000`
+- 健康检查：`http://localhost:3000/healthz`
+- web：`http://localhost:5173`
+
+`packages/server/.env` 中的 CORS Origin 以英文逗号分隔。附录 A 的限额可通过
+`LIMIT_<分组>_<配置名>` 形式覆盖，例如 `LIMIT_INGEST_MAX_BODY_BYTES=131072` 或
+`LIMIT_QUERY_MAX_ROWS=20000`；未设置时严格使用设计文档默认值。
+
+常用验证命令：
+
+```bash
+pnpm -r typecheck
+pnpm -r lint
+pnpm -r test
+pnpm -r build
+```

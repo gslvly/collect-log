@@ -1,0 +1,7 @@
+node_modules
+dist
+coverage
+pnpm-lock.yaml
+DESIGN.md
+AGENTS.md
+packages/server/src/config/limits.ts

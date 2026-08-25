@@ -1,0 +1,26 @@
+{
+  "name": "@collect-log/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "vue-tsc --noEmit",
+    "lint": "eslint src vite.config.ts",
+    "test": "vitest run --passWithNoTests",
+    "build": "vue-tsc --noEmit && vite build"
+  },
+  "dependencies": {
+    "echarts": "6.1.0",
+    "element-plus": "2.14.5",
+    "pinia": "4.0.3",
+    "vue": "3.5.41",
+    "vue-router": "5.2.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "6.0.8",
+    "vite": "8.2.2",
+    "vitest": "4.1.11",
+    "vue-tsc": "3.3.11"
+  }
+}
