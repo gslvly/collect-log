@@ -52,7 +52,8 @@ E-4 数据概览·明细查询·统计分析／E-5 账户管理。
       注意 10.4 第 5 条的成功提示也跟着改了——**不要再提示「该 Key 已永久退役」**，
       按 5.2 `dropped` 的 Key 可以重建，只是建出的是一列全新的空列）
 - [ ] 上报接入文档页（密钥展示 + 可一键复制的 TypeScript 示例，逐字取自 DESIGN 8.1.3）
-- [ ] 数据明细查询（条件构造器 + 游标分页）
+- [ ] 数据明细查询（条件构造器 + 游标分页 + 结果表格支持拖动列顺序/隐藏列/显示列，
+      纯前端本地状态，不落后端，见 DESIGN 9.1）
 - [ ] 统计分析（ECharts 图表）
 - [ ] 账户管理
 - [ ] 高危操作两级确认（10.4）：危险色按钮收进「更多」菜单 → 一级弹窗展示 key/label/type + 实时非空行数 → 二级要求手输字段 Key → 请求带 `confirm` → 成功提示「该列历史数据已永久删除、不可恢复」
@@ -119,9 +120,9 @@ DESIGN 17.1–17.5
 - [ ] `docker-compose.yml`
 - [ ] 环境变量收敛到 `.env` + 仓库内的 `example.env` 模板
 - [ ] Dockerfile 的初始化 / 启动命令先建好 `$DATA_DIR/sqlite3` 与 `$DATA_DIR/clickhouse`
-      两个子目录（DESIGN 3.3.2），建不出来直接停止启动，不进 Node。
-      这是 A-0 那条「`sqliteDatabase` 模块级单例在 import 时 mkdir」的最终处置
-      （2026-08-28 拍板：**不改 Node 代码形态**，单例保留，目录由启动脚本负责）。
+      两个子目录（DESIGN 3.3.2），建不出来直接停止启动，不进 Node
+      （2026-08-28 拍板：`sqliteDatabase` 保持模块级单例、**不改 Node 代码形态**，
+      import 时 mkdir 与目录可写性一律由启动脚本兜底）。
       **必须用 `install -d -m 700` 而不是 `mkdir -p`**，并补一条 `test -w` 提前失败，理由有两条：
       ① `mkdir -p` 对「已存在但权限不对 / 不可写」的目录一律返回 0，挡不住任何东西；
       ② `mkdirSync(dir, { recursive: true, mode: 0o700 })` 的 `mode` **只对新建目录生效**
@@ -165,74 +166,18 @@ DESIGN 17.1–17.5
 
 ## 二、验收遗留（后续阶段必须处理）
 
-### 来自阶段 A-0（SQLite 迁移）验收
-
-- [ ] **`sqliteDatabase` 模块级单例仍在 import 时 mkdir 并打开库文件**（`src/infra/sqlite.ts:132`
-      的 `export const sqliteDatabase = openSqliteDatabase(env.DATA_DIR)`，`mkdirSync` 在 `:57`）。
-      `DATA_DIR` 不可写时进程会在模块加载阶段抛错，此时 logger 还没建好，报错不走结构化日志。
-      ~~阶段 B 接启动流程时处理。~~ ~~改到阶段 C 一并处理。~~
-      **阶段 C 也没做，是我在派工时明确写进禁止项的**（2026-08-27 验收记）。理由：
-      ① `server.ts` 已有 `assertSqliteDirectoryWritable()` 在动态 import 之前跑，
-      `DATA_DIR` 不可写时会打印明确的 stderr 原因并 `exit(1)`，**这个失败模式实际已被覆盖**，
-      剩下的只是「报错格式不是结构化 JSON」；
-      ② 改成惰性单例要动 `repository.ts` / `reconcile.ts` / `schema.ts` 等全部 import 点，
-      与 ingest 毫无关系，风险远大于收益。
-      ~~**结论：降级为「非缺陷的形态问题」，挪到阶段 G**。~~
-      **2026-08-28 项目负责人拍板：不改代码形态。**改由 Dockerfile 的初始化 / 启动命令
-      先 `mkdir -p $DATA_DIR/sqlite3 $DATA_DIR/clickhouse`（DESIGN 3.3.2 的两个子目录），
-      建不出来就直接停止启动、不进 Node。`sqliteDatabase` 保持模块级单例。
-      **落地在阶段 G**，见下面 G 的待办。
-
-### 来自阶段 A-2（字段变更）验收
-
-- [ ] **五条补充规则待你确认。** DESIGN 没覆盖，由我拍板后交给 codex 实现，均已端到端验证生效：
-  1. 可操作字段 = `status = 'active'` 的行；对 `deprecated` / `dropped` / `renamed` 或
-     完全不存在的 Key 做变更一律 `FIELD_NOT_FOUND`(404)。
-  2. 字段变更要求物理表存在 → 只允许表状态 `active` / `disabled`；
-     `creating` / `failed` / `archived` 返回 `TABLE_STATE_CONFLICT`(409)。
-     （不复用 `TABLE_NOT_READY` / `TABLE_DISABLED`，那是上报路径 DESIGN 8.2 的语义。）
-  3. `FIELD_KEY_EXISTS`(409) = Key 正被一行 `active` 占用；`FIELD_KEY_RETIRED`(409) = Key 是
-     `deprecated`。`dropped` / `renamed` 自 2026-08-28 起可复用，不再产生冲突（见 DESIGN 5.2）。
-  4. 15.4 的 7 条路由全部 `admin` 起，含 `usage`（它服务于高危二次确认弹窗）。
-  5. 软废弃使 `schema_version` 加一（依据 DESIGN 5.3 开头那句，表格里该行未写「版本不变」）。
-
-### 来自阶段 C（上报接口）验收
-
-**派工时我替 DESIGN 拍板补充的规则**（均已落地并有测试，已拍板存档）：
-
-1. **校验顺序**：DESIGN 8.1.2 与 8.2 的步骤顺序有出入（8.2 把「读表定义」排在验签之后，
-   但验签必须先拿到该表的密钥）。最终落地顺序：Origin → 限流 → `projectId` 格式 → envelope 解析 →
-   `p` 与 URL 比对 → 读表定义 → 时间窗 → nonce → **验签** → 表状态 → `d` 大小 → payload 解析 →
-   `recordId` → `occurredAt` → 字段数 → 字段白名单。
-   即**表状态在验签之后**（不给未验签者探测表状态），**nonce 在验签之前**（照 DESIGN 8.1.2 原文）。
-2. **表状态 `failed` → `TABLE_NOT_READY`(503)**。DESIGN 8.2 第 4 步只写了 `disabled` / `archived` /
-   `creating`，没提 `failed`；`failed` 表的物理表可能压根不存在，语义上就是「还没就绪」。
-3. **nonce 的 key 是 `${projectId}:${nonce}`**。DESIGN 只说「`n` 在进程内 LRU 中未出现过」，
-   没定义作用域；按项目隔离，避免 A 项目的 nonce 误杀 B 项目。
-4. **`dropped` / `renamed` 的 Key 按 `UNKNOWN_FIELD` 处理，只有 `deprecated` 才是 `DEPRECATED_FIELD`**
-   （物理列已经不存在了，与「不认识」等价）。与 A-2 补充规则 1 的风格一致。
-   为区分二者，**只在已经发现未知 Key 的错误路径上**多查一次 SQLite，成功路径不受影响。
-5. **值为 `null` / `undefined` 视为「未提交该字段」**（写 `NULL`；该字段若 `required` 则报
-   `REQUIRED_FIELD_MISSING`）。空字符串仍是「明确提交了空串」，符合 DESIGN 6.6 的空值语义。
-6. **字符串长度按 UTF-8 字节数**算（不是 UTF-16 码元）。
-7. **同一 payload 里多种字段错误并存时，先报第一个未知 Key**（按 `Object.keys` 的插入顺序），
-   顺序已被测试锁住。
-8. **不带 `Origin` 头的请求放行**（非浏览器客户端可任意伪造，DESIGN 12.1 明说它不是依赖项）；
-   白名单含 `*` 时全放行，此时 `/api/ingest/` 的 CORS 响应头也发 `*`（`app.ts` 的 `corsDelegate`
-   为此加了一个分支，控制台路径行为不变）。
-
-- [ ] **未验签的请求也会占用 nonce 空间。** 这是 DESIGN 8.1.2 自己的顺序（第 3 步 nonce、
-      第 4 步验签）导致的：攻击者可以用任意 nonce 刷 LRU。唯一屏障是前置的令牌桶限流
-      （IP 100/秒）。V1 可接受，记录备查。
-
 ### 来自阶段 E-2（表列表与建表）验收
 
 - [ ] **建表路径的 ClickHouse 故障映射成 `INTERNAL_ERROR`，不是 `CLICKHOUSE_UNAVAILABLE`(503)。**
       阶段 D 拍板的 `classifyClickHouseError()` 只接在查询与上报路径上，建表 / DDL 路径没接。
       2026-08-28 验收时停掉 `log-ch` 实测：表正确落 `failed`、前端列表刷新出「失败」行、
       提示是「服务暂时不可用，请稍后重试」（`INTERNAL_ERROR` 的中文映射）。
-      行为正确、无数据不一致，只是错误码语义不如 503 精确。要统一得改服务端
-      `domain/tables/repository.ts` 的建表分支，**留待阶段 F 或 G 决定，不在 E 阶段动**。
+      行为正确、无数据不一致，只是错误码语义不如 503 精确。
+      **2026-08-28 拍板：统一改成 503。** `domain/tables/repository.ts` 的 `create()` /
+      `retry()` 里 `createPhysicalTable()` 抛出的错误，按 D 阶段同一套
+      `classifyClickHouseError()` 分类：`unavailable` → `CLICKHOUSE_UNAVAILABLE`(503)，
+      其余维持现状（`INTERNAL_ERROR`）。`markCreatingTableFailed(projectId)` 这一步两种情况
+      都要执行，只是最终抛给路由层的错误类型要分叉。留待阶段 F 或 G 实现，不在 E 阶段动。
 - [ ] **模板回填与字段列表的顺序是 `ORDER BY field_key`**（`domain/tables/repository.ts:682`），
       不是源表定义字段时的顺序。E-3 的字段配置页会看到同样的顺序。
       V1 没有「字段排序」概念（DESIGN 5.2 未定义），记录备查。
@@ -317,3 +262,11 @@ DESIGN 17.1–17.5
 - 物理表名 / 列名只能来自服务端白名单，所有值必须参数化；SQLite 侧一律预编译语句绑定。
 - 业务数据表查询一律不加 `FINAL`；元数据已在 SQLite，`FINAL` / `PREWHERE` 注意事项不再适用。
 - 唯一性靠数据库约束，不靠先查后写。
+- **nonce 攻击原理（已知且判定 V1 可接受，不要当缺陷重开）**：`routes.ts` 里的校验顺序是
+  时间窗 → `nonceCache.consume()` → 验签（照抄 DESIGN 8.1.2 原文顺序），`consume()`
+  无条件执行、不等验签结果。因此攻击者**不需要拿到 `ingestSecret`**，只要拿任意伪造的
+  `(projectId, nonce)` 对猛发请求，就能把 10 万容量的进程内 LRU（`nonce.ts`）刷满，
+  将合法请求已记录的 nonce 挤出缓存——被挤出等于"看起来没出现过"，原本已用过的 nonce
+  因此可以被重新提交、绕开 `REPLAYED_NONCE`。唯一挡这条路的是前置的 IP 令牌桶限流
+  （100/秒）。签名本身不受影响（改 nonce 会导致签名对不上，见 `design/08-上传接口.md:44`），
+  这条攻击面只用来刷 nonce 缓存本身，不能用来伪造合法数据。
