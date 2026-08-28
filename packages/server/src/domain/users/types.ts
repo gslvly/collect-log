@@ -12,7 +12,6 @@ export interface UserRecord {
   passwordHash: string;
   role: UserRole;
   status: UserStatus;
-  version: number;
   createdAt: string;
   updatedAt: string;
 }

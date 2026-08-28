@@ -156,6 +156,29 @@ describe('Fastify application foundation', () => {
 
     expect(Date.now() - startedAt).toBeLessThan(1_000);
     expect(response.statusCode).toBe(503);
-    expect(response.json()).toMatchObject({ status: 'degraded', clickhouse: 'error' });
+    expect(response.json()).toMatchObject({
+      status: 'degraded',
+      clickhouse: 'error',
+      sqlite: 'ok',
+    });
+  });
+
+  it('returns degraded when the SQLite quick check fails', async () => {
+    const app = await buildApp({
+      pingClickHouse: () => Promise.resolve(),
+      pingSqlite: () => {
+        throw new Error('quick_check failed');
+      },
+    });
+    apps.push(app);
+
+    const response = await app.inject({ method: 'GET', url: '/healthz' });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toMatchObject({
+      status: 'degraded',
+      clickhouse: 'ok',
+      sqlite: 'error',
+    });
   });
 });

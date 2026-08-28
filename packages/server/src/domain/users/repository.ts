@@ -1,8 +1,12 @@
 import { randomUUID } from 'node:crypto';
 
 import { AppError } from '../../errors.js';
-import { metaClient, parameterizedQuery } from '../../infra/clickhouse.js';
-import { serial } from '../../infra/serial.js';
+import {
+  isSqliteConstraintConflict,
+  sqliteDatabase,
+  type PreparedStatement,
+  type SqliteDatabase,
+} from '../../infra/sqlite.js';
 import { hashPassword, verifyPassword } from './password.js';
 import { assertCanDeleteUser, assertCanModifyUser } from './permissions.js';
 import { isUserRole, type UserRecord, type UserRole, type UserStatus } from './types.js';
@@ -13,13 +17,24 @@ interface AppUserRow {
   password_hash: string;
   role: string;
   status: string;
-  version: number | string;
   created_at: string;
   updated_at: string;
 }
 
 interface CountRow {
-  count: number | string;
+  count: number;
+}
+
+interface UserStatements {
+  findActiveByUsername: PreparedStatement<AppUserRow>;
+  findByUsername: PreparedStatement<AppUserRow>;
+  list: PreparedStatement<AppUserRow>;
+  insert: PreparedStatement;
+  updatePassword: PreparedStatement;
+  updateStatus: PreparedStatement;
+  countActiveSuperAdmins: PreparedStatement<CountRow>;
+  deleteByUsername: PreparedStatement;
+  findSuperAdmin: PreparedStatement<Pick<AppUserRow, 'username'>>;
 }
 
 export interface CreateUserInput {
@@ -30,103 +45,54 @@ export interface CreateUserInput {
 
 export type BootstrapUserResult = 'already_exists' | 'created' | 'credentials_missing';
 
-function clickHouseDateTime(date: Date): string {
-  return date.toISOString().replace('T', ' ').replace('Z', '');
-}
-
 function parseRole(role: string): UserRole {
   if (role === 'super_admin' || role === 'admin' || role === 'user') {
     return role;
   }
-  throw new Error(`Invalid role stored in meta.app_users: ${role}`);
+  throw new Error(`Invalid role stored in app_users: ${role}`);
 }
 
 function parseStatus(status: string): UserStatus {
   if (status === 'active' || status === 'disabled') {
     return status;
   }
-  throw new Error(`Invalid status stored in meta.app_users: ${status}`);
+  throw new Error(`Invalid status stored in app_users: ${status}`);
 }
 
 function mapUser(row: AppUserRow): UserRecord {
-  const version = Number(row.version);
-  if (!Number.isSafeInteger(version) || version < 1) {
-    throw new Error(`Invalid version stored in meta.app_users for ${row.username}`);
-  }
-
   return {
     userId: row.user_id,
     username: row.username,
     passwordHash: row.password_hash,
     role: parseRole(row.role),
     status: parseStatus(row.status),
-    version,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
 }
 
-async function insertUser(row: AppUserRow): Promise<void> {
-  await metaClient.insert({
-    table: 'meta.app_users',
-    values: [row],
-    format: 'JSONEachRow',
-  });
-}
-
-async function findUserByUsername(username: string): Promise<UserRecord | null> {
-  const rows = await parameterizedQuery<AppUserRow>({
-    client: metaClient,
-    query: `SELECT *
-FROM meta.app_users FINAL
-WHERE username = {username:String}`,
-    params: { username },
-  });
-  return rows[0] === undefined ? null : mapUser(rows[0]);
-}
-
-function nextVersionRow(
-  current: UserRecord,
-  changes: Partial<Pick<AppUserRow, 'password_hash' | 'status'>>,
-): AppUserRow {
-  return {
-    user_id: current.userId,
-    username: current.username,
-    password_hash: changes.password_hash ?? current.passwordHash,
-    role: current.role,
-    status: changes.status ?? current.status,
-    version: current.version + 1,
-    created_at: current.createdAt,
-    updated_at: clickHouseDateTime(new Date()),
-  };
+function throwUsernameExists(error: unknown, username: string): never {
+  if (isSqliteConstraintConflict(error)) {
+    throw new AppError('USERNAME_EXISTS', `Username "${username}" already exists`);
+  }
+  throw error;
 }
 
 export class UserRepository {
+  private preparedStatements: UserStatements | undefined;
+
+  constructor(private readonly database: SqliteDatabase = sqliteDatabase) {}
+
   async findActiveByUsername(username: string): Promise<UserRecord | null> {
-    const rows = await parameterizedQuery<AppUserRow>({
-      client: metaClient,
-      query: `SELECT *
-FROM meta.app_users FINAL
-WHERE username = {username:String}
-  AND status = 'active';`,
-      params: { username },
-    });
-    return rows[0] === undefined ? null : mapUser(rows[0]);
+    return this.findActiveByUsernameSync(username);
   }
 
-  findByUsername(username: string): Promise<UserRecord | null> {
-    return findUserByUsername(username);
+  async findByUsername(username: string): Promise<UserRecord | null> {
+    return this.findByUsernameSync(username);
   }
 
   async list(): Promise<UserRecord[]> {
-    const rows = await parameterizedQuery<AppUserRow>({
-      client: metaClient,
-      query: `SELECT *
-FROM meta.app_users FINAL
-ORDER BY username`,
-      params: {},
-    });
-    return rows.map(mapUser);
+    return this.statements().list.all().map(mapUser);
   }
 
   async create(input: CreateUserInput): Promise<UserRecord> {
@@ -134,65 +100,84 @@ ORDER BY username`,
       throw new AppError('INVALID_JSON', 'Account role is invalid');
     }
     const passwordHash = await hashPassword(input.password);
+    const now = new Date().toISOString();
+    const row: AppUserRow = {
+      user_id: randomUUID(),
+      username: input.username,
+      password_hash: passwordHash,
+      role: input.role,
+      status: 'active',
+      created_at: now,
+      updated_at: now,
+    };
 
-    return serial(async () => {
-      if ((await findUserByUsername(input.username)) !== null) {
-        throw new AppError('USERNAME_EXISTS', `Username "${input.username}" already exists`);
-      }
-
-      const now = clickHouseDateTime(new Date());
-      const row: AppUserRow = {
-        user_id: randomUUID(),
-        username: input.username,
-        password_hash: passwordHash,
-        role: input.role,
-        status: 'active',
-        version: 1,
-        created_at: now,
-        updated_at: now,
-      };
-      await insertUser(row);
-      return mapUser(row);
-    });
+    try {
+      return this.database.transaction(() => {
+        this.insertUser(row);
+        return mapUser(row);
+      });
+    } catch (error) {
+      return throwUsernameExists(error, input.username);
+    }
   }
 
-  changeOwnPassword(username: string, currentPassword: string, newPassword: string): Promise<void> {
-    return serial(async () => {
-      const current = await this.findActiveByUsername(username);
+  async changeOwnPassword(
+    username: string,
+    currentPassword: string,
+    newPassword: string,
+  ): Promise<void> {
+    const inspected = this.findActiveByUsernameSync(username);
+    if (inspected === null) {
+      throw new AppError('USER_NOT_FOUND', `User "${username}" was not found`);
+    }
+    if (!(await verifyPassword(inspected.passwordHash, currentPassword))) {
+      throw new AppError('INVALID_CREDENTIALS', 'Invalid username or password');
+    }
+    const passwordHash = await hashPassword(newPassword);
+
+    this.database.transaction(() => {
+      const current = this.findActiveByUsernameSync(username);
       if (current === null) {
         throw new AppError('USER_NOT_FOUND', `User "${username}" was not found`);
       }
-      if (!(await verifyPassword(current.passwordHash, currentPassword))) {
+      if (current.passwordHash !== inspected.passwordHash) {
         throw new AppError('INVALID_CREDENTIALS', 'Invalid username or password');
       }
-
-      const passwordHash = await hashPassword(newPassword);
-      await insertUser(nextVersionRow(current, { password_hash: passwordHash }));
+      this.updatePassword(username, passwordHash);
     });
   }
 
-  resetPassword(
+  async resetPassword(
     username: string,
     newPassword: string,
     operatorRole: UserRole,
   ): Promise<UserRecord> {
-    return serial(async () => {
-      const current = await findUserByUsername(username);
+    const inspected = this.findByUsernameSync(username);
+    if (inspected === null) {
+      throw new AppError('USER_NOT_FOUND', `User "${username}" was not found`);
+    }
+    assertCanModifyUser(operatorRole, inspected.role);
+    const passwordHash = await hashPassword(newPassword);
+    return this.database.transaction(() => {
+      const current = this.findByUsernameSync(username);
       if (current === null) {
         throw new AppError('USER_NOT_FOUND', `User "${username}" was not found`);
       }
       assertCanModifyUser(operatorRole, current.role);
 
-      const passwordHash = await hashPassword(newPassword);
-      const row = nextVersionRow(current, { password_hash: passwordHash });
-      await insertUser(row);
-      return mapUser(row);
+      const updatedAt = new Date().toISOString();
+      this.updatePassword(username, passwordHash, updatedAt);
+      return { ...current, passwordHash, updatedAt };
     });
   }
 
-  setStatus(username: string, status: UserStatus, operatorRole: UserRole): Promise<UserRecord> {
-    return serial(async () => {
-      const current = await findUserByUsername(username);
+  async setStatus(
+    username: string,
+    status: UserStatus,
+    operatorRole: UserRole,
+  ): Promise<UserRecord> {
+    return this.database.transaction(() => {
+      const current = this.findByUsernameSync(username);
       if (current === null) {
         throw new AppError('USER_NOT_FOUND', `User "${username}" was not found`);
       }
@@ -202,75 +187,135 @@ ORDER BY username`,
       }
 
       if (current.role === 'super_admin' && current.status === 'active' && status === 'disabled') {
-        const rows = await parameterizedQuery<CountRow>({
-          client: metaClient,
-          query: `SELECT count() AS count
-FROM meta.app_users FINAL
-WHERE role = {role:String}
-  AND status = {status:String}`,
-          params: { role: 'super_admin', status: 'active' },
-        });
-        if (Number(rows[0]?.count ?? 0) <= 1) {
+        const count = this.statements().countActiveSuperAdmins.get('super_admin', 'active');
+        if ((count?.count ?? 0) <= 1) {
           throw new AppError('LAST_SUPER_ADMIN', 'The last active super_admin cannot be disabled');
         }
       }
 
-      const row = nextVersionRow(current, { status });
-      await insertUser(row);
-      return mapUser(row);
+      const updatedAt = new Date().toISOString();
+      const result = this.statements().updateStatus.run(status, updatedAt, username);
+      if (result.changes !== 1) {
+        throw new AppError('USER_NOT_FOUND', `User "${username}" was not found`);
+      }
+      return { ...current, status, updatedAt };
     });
   }
 
-  delete(username: string, operatorRole: UserRole): Promise<UserRecord> {
-    return serial(async () => {
-      const current = await findUserByUsername(username);
+  async delete(username: string, operatorRole: UserRole): Promise<UserRecord> {
+    return this.database.transaction(() => {
+      const current = this.findByUsernameSync(username);
       if (current === null) {
         throw new AppError('USER_NOT_FOUND', `User "${username}" was not found`);
       }
       assertCanDeleteUser(operatorRole, current.role);
 
-      await metaClient.command({
-        query: 'DELETE FROM meta.app_users WHERE username = {username:String}',
-        query_params: { username },
-        clickhouse_settings: { mutations_sync: '2' },
-      });
+      const result = this.statements().deleteByUsername.run(username);
+      if (result.changes !== 1) {
+        throw new AppError('USER_NOT_FOUND', `User "${username}" was not found`);
+      }
       return current;
     });
   }
 
-  bootstrapSuperAdmin(username?: string, password?: string): Promise<BootstrapUserResult> {
-    return serial(async () => {
-      const superAdmins = await parameterizedQuery<Pick<AppUserRow, 'username'>>({
-        client: metaClient,
-        query: `SELECT username
-FROM meta.app_users FINAL
-WHERE role = {role:String}
-LIMIT 1`,
-        params: { role: 'super_admin' },
-      });
-      if (superAdmins.length > 0) {
-        return 'already_exists';
-      }
-      if (username === undefined || password === undefined) {
-        return 'credentials_missing';
-      }
-      if ((await findUserByUsername(username)) !== null) {
-        throw new AppError('USERNAME_EXISTS', `Username "${username}" already exists`);
-      }
+  async bootstrapSuperAdmin(username?: string, password?: string): Promise<BootstrapUserResult> {
+    if (this.hasSuperAdmin()) {
+      return 'already_exists';
+    }
+    if (username === undefined || password === undefined) {
+      return 'credentials_missing';
+    }
 
-      const now = clickHouseDateTime(new Date());
-      await insertUser({
-        user_id: randomUUID(),
-        username,
-        password_hash: await hashPassword(password),
-        role: 'super_admin',
-        status: 'active',
-        version: 1,
-        created_at: now,
-        updated_at: now,
+    const passwordHash = await hashPassword(password);
+    try {
+      return this.database.transaction(() => {
+        if (this.hasSuperAdmin()) {
+          return 'already_exists';
+        }
+        const now = new Date().toISOString();
+        this.insertUser({
+          user_id: randomUUID(),
+          username,
+          password_hash: passwordHash,
+          role: 'super_admin',
+          status: 'active',
+          created_at: now,
+          updated_at: now,
+        });
+        return 'created';
       });
-      return 'created';
-    });
+    } catch (error) {
+      return throwUsernameExists(error, username);
+    }
+  }
+
+  private statements(): UserStatements {
+    this.preparedStatements ??= {
+      findActiveByUsername: this.database.prepare<AppUserRow>(`SELECT *
+FROM app_users
+WHERE username = ? AND status = 'active'`),
+      findByUsername: this.database.prepare<AppUserRow>(`SELECT *
+FROM app_users
+WHERE username = ?`),
+      list: this.database.prepare<AppUserRow>(`SELECT *
+FROM app_users
+ORDER BY username`),
+      insert: this.database.prepare(`INSERT INTO app_users
+  (user_id, username, password_hash, role, status, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)`),
+      updatePassword: this.database.prepare(`UPDATE app_users
+SET password_hash = ?, updated_at = ?
+WHERE username = ?`),
+      updateStatus: this.database.prepare(`UPDATE app_users
+SET status = ?, updated_at = ?
+WHERE username = ?`),
+      countActiveSuperAdmins: this.database.prepare<CountRow>(`SELECT count(*) AS count
+FROM app_users
+WHERE role = ? AND status = ?`),
+      deleteByUsername: this.database.prepare('DELETE FROM app_users WHERE username = ?'),
+      findSuperAdmin: this.database.prepare<Pick<AppUserRow, 'username'>>(`SELECT username
+FROM app_users
+WHERE role = ?
+LIMIT 1`),
+    };
+    return this.preparedStatements;
+  }
+
+  private findActiveByUsernameSync(username: string): UserRecord | null {
+    const row = this.statements().findActiveByUsername.get(username);
+    return row === undefined ? null : mapUser(row);
+  }
+
+  private findByUsernameSync(username: string): UserRecord | null {
+    const row = this.statements().findByUsername.get(username);
+    return row === undefined ? null : mapUser(row);
+  }
+
+  private hasSuperAdmin(): boolean {
+    return this.statements().findSuperAdmin.get('super_admin') !== undefined;
+  }
+
+  private insertUser(row: AppUserRow): void {
+    this.statements().insert.run(
+      row.user_id,
+      row.username,
+      row.password_hash,
+      row.role,
+      row.status,
+      row.created_at,
+      row.updated_at,
+    );
+  }
+
+  private updatePassword(
+    username: string,
+    passwordHash: string,
+    updatedAt = new Date().toISOString(),
+  ): void {
+    const result = this.statements().updatePassword.run(passwordHash, updatedAt, username);
+    if (result.changes !== 1) {
+      throw new AppError('USER_NOT_FOUND', `User "${username}" was not found`);
+    }
   }
 }
 

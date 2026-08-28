@@ -1,18 +1,23 @@
 import { randomUUID } from 'node:crypto';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import type { FastifyInstance } from 'fastify';
-import { afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 
 import { buildApp } from '../../app.js';
-import { bootstrapSchema } from '../../bootstrap/schema.js';
+import { bootstrapSqliteSchema } from '../../bootstrap/schema.js';
+import { openSqliteDatabase } from '../../infra/sqlite.js';
 import { CaptchaService } from '../auth/captcha.js';
-import { metaClient } from '../../infra/clickhouse.js';
-import { serial } from '../../infra/serial.js';
-import { userRepository } from './repository.js';
+import { UserRepository } from './repository.js';
 import type { UserRole } from './types.js';
 
 const CAPTCHA_CODE = 'ABCDE';
 const namespace = `stage2_${randomUUID().replaceAll('-', '')}_`;
+const testDataDir = mkdtempSync(join(tmpdir(), 'collect-log-accounts-'));
+const testDatabase = openSqliteDatabase(testDataDir);
+const users = new UserRepository(testDatabase);
 const apps: FastifyInstance[] = [];
 
 function username(label: string): string {
@@ -22,6 +27,7 @@ function username(label: string): string {
 async function makeApp(): Promise<FastifyInstance> {
   const app = await buildApp({
     captchaService: new CaptchaService(120, () => CAPTCHA_CODE),
+    userRepository: users,
   });
   apps.push(app);
   return app;
@@ -33,7 +39,7 @@ async function createFixtureUser(
   password = 'initial-password',
 ): Promise<string> {
   const name = username(label);
-  await userRepository.create({ username: name, password, role });
+  await users.create({ username: name, password, role });
   return name;
 }
 
@@ -64,34 +70,35 @@ function authorization(token: string): { authorization: string } {
   return { authorization: `Bearer ${token}` };
 }
 
-async function cleanupUsers(): Promise<void> {
-  await serial(async () => {
-    await metaClient.command({
-      query: 'DELETE FROM meta.app_users WHERE startsWith(username, {prefix:String})',
-      query_params: { prefix: namespace },
-      clickhouse_settings: { mutations_sync: '2' },
-    });
+function cleanupUsers(): void {
+  testDatabase.transaction(() => {
+    testDatabase.prepare('DELETE FROM app_users').run();
   });
 }
 
 beforeAll(async () => {
-  await bootstrapSchema();
-  await cleanupUsers();
+  bootstrapSqliteSchema(testDatabase);
+  cleanupUsers();
 });
 
 afterEach(async () => {
   await Promise.all(apps.splice(0).map((app) => app.close()));
-  await cleanupUsers();
+  cleanupUsers();
 });
 
-describe('DESIGN 17.4 account acceptance against ClickHouse', () => {
+afterAll(() => {
+  testDatabase.close();
+  rmSync(testDataDir, { recursive: true, force: true });
+});
+
+describe('DESIGN 17.4 account acceptance against SQLite', () => {
   it('bootstraps exactly one initial super_admin and stores only its Argon2id hash', async () => {
-    const first = await userRepository.bootstrapSuperAdmin(username('bootstrap'), 'plain-password');
-    const second = await userRepository.bootstrapSuperAdmin(
+    const first = await users.bootstrapSuperAdmin(username('bootstrap'), 'plain-password');
+    const second = await users.bootstrapSuperAdmin(
       username('ignored-bootstrap'),
       'ignored-password',
     );
-    const stored = await userRepository.findActiveByUsername(username('bootstrap'));
+    const stored = await users.findActiveByUsername(username('bootstrap'));
 
     expect(first).toBe('created');
     expect(second).toBe('already_exists');
@@ -121,7 +128,7 @@ describe('DESIGN 17.4 account acceptance against ClickHouse', () => {
         headers: authorization(token),
       });
       expect(deleted.statusCode).toBe(200);
-      await expect(userRepository.findByUsername(target)).resolves.toBeNull();
+      await expect(users.findByUsername(target)).resolves.toBeNull();
     }
   });
 
@@ -235,7 +242,7 @@ describe('DESIGN 17.4 account acceptance against ClickHouse', () => {
   });
 });
 
-describe('DESIGN 17.5 account concurrency against ClickHouse', () => {
+describe('DESIGN 17.5 account concurrency against SQLite', () => {
   it('allows exactly one of two concurrent duplicate username creations', async () => {
     const app = await makeApp();
     const root = await createFixtureUser('root', 'super_admin');

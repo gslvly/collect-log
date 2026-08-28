@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+#
+# api-curl —— 本项目后端专用的已鉴权 curl。
+#
+# 用法与 curl 完全一致，唯一区别：自动带上 Authorization: Bearer <token>，
+# 并把以 / 开头的相对路径补成后端地址。
+#
+#   api-curl /api/auth/me
+#   api-curl -X POST /api/tables -H 'Content-Type: application/json' -d '{"name":"x"}'
+#   api-curl -sS http://localhost:3000/healthz
+#
+# token 默认用 packages/server/.env 里的 JWT_SECRET 就地签发（HS256，与后端同秘钥），
+# 因此不需要登录、不需要图形验证码。
+#
+# 可选环境变量：
+#   API_CURL_TOKEN  直接指定 token，跳过本地签发
+#   API_CURL_BASE   后端地址，默认 http://127.0.0.1:$PORT（PORT 取自 .env，缺省 3000）
+#   API_CURL_USER   token 里的 username，默认 .env 的 BOOTSTRAP_ADMIN_USERNAME，缺省 admin
+#   API_CURL_ROLE   token 里的 role，默认 super_admin
+#   API_CURL_TTL    token 有效期（秒），默认 43200
+#   API_CURL_DEBUG  置 1 时把最终执行的 curl 命令打到 stderr
+#
+# 命令行里已经自带 Authorization 头时，不再注入。
+
+set -euo pipefail
+
+# ---------- 定位仓库根（脚本常以软链接方式出现在 .claude / .codex 下） ----------
+self="${BASH_SOURCE[0]}"
+while [ -L "$self" ]; do
+  target="$(readlink "$self")"
+  case "$target" in
+    /*) self="$target" ;;
+    *) self="$(cd "$(dirname "$self")" && pwd)/$target" ;;
+  esac
+done
+script_dir="$(cd "$(dirname "$self")" && pwd)"
+
+find_root() {
+  local dir="$1"
+  while [ "$dir" != "/" ]; do
+    if [ -d "$dir/packages/server" ]; then
+      printf '%s' "$dir"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+  done
+  return 1
+}
+
+root="$(find_root "$script_dir" || find_root "$PWD" || true)"
+
+env_file=""
+if [ -n "$root" ]; then
+  if [ -f "$root/packages/server/.env" ]; then
+    env_file="$root/packages/server/.env"
+  elif [ -f "$root/packages/server/.env.example" ]; then
+    env_file="$root/packages/server/.env.example"
+  fi
+fi
+
+read_env() {
+  [ -n "$env_file" ] || return 0
+  sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$env_file" |
+    tail -n 1 |
+    sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//"
+}
+
+# ---------- 后端地址 ----------
+port="$(read_env PORT)"
+base="${API_CURL_BASE:-http://127.0.0.1:${port:-3000}}"
+base="${base%/}"
+
+# ---------- token ----------
+b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+
+mint_token() {
+  local secret username role ttl now exp header payload signing_input signature
+  secret="$(read_env JWT_SECRET)"
+  if [ -z "$secret" ]; then
+    echo "api-curl: 找不到 JWT_SECRET（${env_file:-无 .env 文件}），请设置 API_CURL_TOKEN" >&2
+    exit 1
+  fi
+  username="${API_CURL_USER:-$(read_env BOOTSTRAP_ADMIN_USERNAME)}"
+  username="${username:-admin}"
+  role="${API_CURL_ROLE:-super_admin}"
+  ttl="${API_CURL_TTL:-43200}"
+  now="$(date +%s)"
+  exp="$((now + ttl))"
+
+  header="$(printf '%s' '{"alg":"HS256","typ":"JWT"}' | b64url)"
+  payload="$(printf '{"username":"%s","role":"%s","iat":%s,"exp":%s}' \
+    "$username" "$role" "$now" "$exp" | b64url)"
+  signing_input="$header.$payload"
+  signature="$(printf '%s' "$signing_input" |
+    openssl dgst -sha256 -hmac "$secret" -binary | b64url)"
+  printf '%s.%s' "$signing_input" "$signature"
+}
+
+# ---------- 参数改写：补全相对 URL ----------
+# 这些选项后面紧跟一个值，值即使以 / 开头也不是 URL。
+value_opts=" -A -b -c -C -d -D -e -E -F -H -K -m -o -P -Q -r -t -T -u -U -w -x -X -y -Y -z "
+value_long_opts=" --abstract-unix-socket --alt-svc --aws-sigv4 --cacert --capath --cert --cert-type --ciphers --config --connect-timeout --connect-to --continue-at --cookie --cookie-jar --crlfile --data --data-ascii --data-binary --data-raw --data-urlencode --delegation --dns-interface --dns-ipv4-addr --dns-ipv6-addr --dns-servers --doh-url --dump-header --egd-file --engine --etag-compare --etag-save --expect100-timeout --form --form-string --ftp-account --ftp-alternative-to-user --ftp-method --ftp-port --happy-eyeballs-timeout-ms --hostpubmd5 --header --hsts --interface --json --keepalive-time --key --key-type --krb --libcurl --limit-rate --local-port --login-options --mail-auth --mail-from --mail-rcpt --max-filesize --max-redirs --max-time --netrc-file --noproxy --oauth2-bearer --output --output-dir --pass --pinnedpubkey --preproxy --proto --proto-default --proto-redir --proxy --proxy-cacert --proxy-capath --proxy-cert --proxy-header --proxy-key --proxy-pass --proxy-service-name --proxy-tlspassword --proxy-tlsuser --proxy-user --pubkey --quote --random-file --range --referer --request --request-target --resolve --retry --retry-delay --retry-max-time --sasl-authzid --service-name --socks4 --socks4a --socks5 --socks5-gssapi-service --socks5-hostname --stderr --telnet-option --time-cond --tls-max --tls13-ciphers --tlsauthtype --tlspassword --tlsuser --trace --trace-ascii --unix-socket --upload-file --url --user --user-agent --write-out "
+
+has_auth_header=0
+expect_value=0
+args=()
+
+for arg in "$@"; do
+  if [ "$expect_value" -eq 1 ]; then
+    expect_value=0
+    args+=("$arg")
+    continue
+  fi
+
+  case "$arg" in
+    --*=*)
+      args+=("$arg")
+      continue
+      ;;
+    --*)
+      case "$value_long_opts" in
+        *" $arg "*) expect_value=1 ;;
+      esac
+      args+=("$arg")
+      continue
+      ;;
+    -[a-zA-Z]*)
+      # 组合短选项：只有最后一个字母才可能带值，例如 -sSo out.txt
+      last="-${arg: -1}"
+      case "$value_opts" in
+        *" $last "*) expect_value=1 ;;
+      esac
+      args+=("$arg")
+      continue
+      ;;
+    /*)
+      args+=("$base$arg")
+      continue
+      ;;
+  esac
+
+  args+=("$arg")
+done
+
+# 命令行里已有 Authorization 头就不再注入
+prev=""
+for arg in "$@"; do
+  case "$arg" in
+    -H*[Aa]uthorization*|--header*[Aa]uthorization*) has_auth_header=1 ;;
+  esac
+  case "$prev" in
+    -H|--header)
+      case "$arg" in
+        [Aa]uthorization:*) has_auth_header=1 ;;
+      esac
+      ;;
+  esac
+  prev="$arg"
+done
+
+if [ "$has_auth_header" -eq 0 ]; then
+  token="${API_CURL_TOKEN:-$(mint_token)}"
+  args=(-H "Authorization: Bearer $token" ${args[@]+"${args[@]}"})
+fi
+
+if [ "${API_CURL_DEBUG:-}" = "1" ]; then
+  printf 'api-curl:' >&2
+  printf ' %q' curl ${args[@]+"${args[@]}"} >&2
+  printf '\n' >&2
+fi
+
+exec curl ${args[@]+"${args[@]}"}

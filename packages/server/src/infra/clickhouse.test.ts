@@ -13,10 +13,9 @@ describe('ClickHouse infrastructure', () => {
     }
   });
 
-  it('pins FINAL safety and readonly query limits', () => {
-    expect(clientDefaultSettings.meta.optimize_move_to_prewhere_if_final).toBe(0);
+  it('keeps metadata DDL defaults empty and pins readonly query limits', () => {
+    expect(clientDefaultSettings.meta).toEqual({});
     expect(clientDefaultSettings.readonly).toMatchObject({
-      optimize_move_to_prewhere_if_final: 0,
       max_execution_time: 10,
       max_memory_usage: '2147483648',
       max_result_rows: '10000',

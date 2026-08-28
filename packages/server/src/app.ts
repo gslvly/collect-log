@@ -8,10 +8,15 @@ import { CaptchaService } from './domain/auth/captcha.js';
 import { registerJwt } from './domain/auth/jwt.js';
 import { CaptchaRateLimiter, LoginRateLimiter } from './domain/auth/rate-limit.js';
 import { registerAuthRoutes } from './domain/auth/routes.js';
+import { registerIngestRoutes } from './domain/ingest/routes.js';
+import { registerQueryRoutes, type QueryRouteOptions } from './domain/query/routes.js';
+import { tableRepository, type TableRepository } from './domain/tables/repository.js';
+import { registerTableRoutes } from './domain/tables/routes.js';
 import { userRepository, type UserRepository } from './domain/users/repository.js';
 import { registerUserRoutes } from './domain/users/routes.js';
 import { AppError, ERROR_HTTP_STATUS, serializeError, type ErrorCode } from './errors.js';
 import { pingClickHouse } from './infra/clickhouse.js';
+import { pingSqlite } from './infra/sqlite.js';
 import { reconcileState } from './reconcile-state.js';
 
 const requestStartedAt = new WeakMap<object, bigint>();
@@ -64,6 +69,9 @@ export interface BuildAppOptions {
   captchaRateLimiter?: CaptchaRateLimiter;
   loginRateLimiter?: LoginRateLimiter;
   pingClickHouse?: () => Promise<void>;
+  pingSqlite?: () => Promise<void>;
+  queryRouteOptions?: QueryRouteOptions;
+  tableRepository?: TableRepository;
   userRepository?: UserRepository;
 }
 
@@ -72,6 +80,8 @@ export async function buildApp(options: BuildAppOptions = {}) {
   const captchaRateLimiter = options.captchaRateLimiter ?? new CaptchaRateLimiter();
   const loginRateLimiter = options.loginRateLimiter ?? new LoginRateLimiter();
   const checkClickHouse = options.pingClickHouse ?? pingClickHouse;
+  const checkSqlite = options.pingSqlite ?? pingSqlite;
+  const tables = options.tableRepository ?? tableRepository;
   const users = options.userRepository ?? userRepository;
   const app = Fastify({
     logger: {
@@ -89,10 +99,14 @@ export async function buildApp(options: BuildAppOptions = {}) {
       return;
     }
 
-    const allowedOrigins = request.url.startsWith('/api/ingest/')
+    const isIngestRequest = request.url.startsWith('/api/ingest/');
+    const allowedOrigins = isIngestRequest
       ? env.INGEST_ALLOWED_ORIGINS
       : env.CONSOLE_ALLOWED_ORIGINS;
-    callback(null, { origin: allowedOrigins });
+    callback(null, {
+      origin: isIngestRequest && allowedOrigins.includes('*') ? '*' : allowedOrigins,
+      exposedHeaders: ['Content-Disposition', 'X-Export-Truncated', 'X-Request-Id'],
+    });
   };
 
   await app.register(cors, () => corsDelegate);
@@ -206,6 +220,9 @@ export async function buildApp(options: BuildAppOptions = {}) {
     userRepository: users,
   });
   registerUserRoutes(app, users);
+  registerTableRoutes(app, tables);
+  registerQueryRoutes(app, tables, options.queryRouteOptions);
+  registerIngestRoutes(app, tables);
 
   app.addHook('onClose', async () => {
     captchaService.close();
@@ -214,23 +231,28 @@ export async function buildApp(options: BuildAppOptions = {}) {
   });
 
   app.get('/healthz', async (_request, reply) => {
-    try {
-      await checkClickHouse();
-      return {
-        status: 'ok',
-        uptimeSeconds: Math.floor(process.uptime()),
-        clickhouse: 'ok',
-        lastReconcile: reconcileState,
-      };
-    } catch (error) {
-      app.log.warn({ err: error }, 'ClickHouse health check failed');
-      return reply.status(503).send({
-        status: 'degraded',
-        uptimeSeconds: Math.floor(process.uptime()),
-        clickhouse: 'error',
-        lastReconcile: reconcileState,
-      });
+    const [clickhouseResult, sqliteResult] = await Promise.allSettled([
+      Promise.resolve().then(() => checkClickHouse()),
+      Promise.resolve().then(() => checkSqlite()),
+    ]);
+    const clickhouse = clickhouseResult.status === 'fulfilled' ? 'ok' : 'error';
+    const sqlite = sqliteResult.status === 'fulfilled' ? 'ok' : 'error';
+
+    if (clickhouseResult.status === 'rejected') {
+      app.log.warn({ err: clickhouseResult.reason }, 'ClickHouse health check failed');
     }
+    if (sqliteResult.status === 'rejected') {
+      app.log.warn({ err: sqliteResult.reason }, 'SQLite health check failed');
+    }
+
+    const payload = {
+      status: clickhouse === 'ok' && sqlite === 'ok' ? 'ok' : 'degraded',
+      uptimeSeconds: Math.floor(process.uptime()),
+      clickhouse,
+      sqlite,
+      lastReconcile: reconcileState,
+    };
+    return payload.status === 'ok' ? payload : reply.status(503).send(payload);
   });
 
   return app;

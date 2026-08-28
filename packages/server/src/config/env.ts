@@ -19,6 +19,7 @@ const origins = z
 const envSchema = z.object({
   PORT: z.coerce.number().int().min(1).max(65_535),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']),
+  DATA_DIR: z.string().min(1),
   CLICKHOUSE_URL: z.string().url(),
   CLICKHOUSE_INGEST_USER: z.string().min(1),
   CLICKHOUSE_INGEST_PASSWORD: z.string().min(1),
