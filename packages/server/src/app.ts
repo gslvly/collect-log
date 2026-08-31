@@ -4,6 +4,7 @@ import { ulid } from 'ulid';
 
 import { env } from './config/env.js';
 import { configuredLimits } from './config/limits.js';
+import { registerFieldTypeRoutes } from './domain/field-types.js';
 import { CaptchaService } from './domain/auth/captcha.js';
 import { registerJwt } from './domain/auth/jwt.js';
 import { CaptchaRateLimiter, LoginRateLimiter } from './domain/auth/rate-limit.js';
@@ -18,8 +19,7 @@ import { AppError, ERROR_HTTP_STATUS, serializeError, type ErrorCode } from './e
 import { pingClickHouse } from './infra/clickhouse.js';
 import { pingSqlite } from './infra/sqlite.js';
 import { reconcileState } from './reconcile-state.js';
-
-const requestStartedAt = new WeakMap<object, bigint>();
+import { markRequestStart, requestDurationMs } from './request-timing.js';
 
 function isPayloadTooLarge(error: unknown): boolean {
   return (
@@ -73,6 +73,8 @@ export interface BuildAppOptions {
   queryRouteOptions?: QueryRouteOptions;
   tableRepository?: TableRepository;
   userRepository?: UserRepository;
+  // 测试用：把结构化日志导向可断言的流，同时绕开 LOG_LEVEL=silent。
+  logStream?: { write(line: string): void };
 }
 
 export async function buildApp(options: BuildAppOptions = {}) {
@@ -85,7 +87,8 @@ export async function buildApp(options: BuildAppOptions = {}) {
   const users = options.userRepository ?? userRepository;
   const app = Fastify({
     logger: {
-      level: env.LOG_LEVEL,
+      level: options.logStream === undefined ? env.LOG_LEVEL : 'info',
+      ...(options.logStream === undefined ? {} : { stream: options.logStream }),
     },
     logController: new LogController({
       disableRequestLogging: true,
@@ -135,21 +138,18 @@ export async function buildApp(options: BuildAppOptions = {}) {
   );
 
   app.addHook('onRequest', async (request, reply) => {
-    requestStartedAt.set(request, process.hrtime.bigint());
+    markRequestStart(request);
     void reply.header('x-request-id', request.id);
   });
 
+  // hijack 的响应不会触发这个钩子，CSV 导出自行补一条同构日志（见 domain/query/routes.ts）。
   app.addHook('onResponse', async (request, reply) => {
-    const startedAt = requestStartedAt.get(request);
-    const durationMs =
-      startedAt === undefined ? 0 : Number(process.hrtime.bigint() - startedAt) / 1_000_000;
-
     request.log.info(
       {
         requestId: request.id,
         route: request.routeOptions.url ?? request.url,
         statusCode: reply.statusCode,
-        durationMs,
+        durationMs: requestDurationMs(request),
       },
       'request completed',
     );
@@ -220,6 +220,7 @@ export async function buildApp(options: BuildAppOptions = {}) {
     userRepository: users,
   });
   registerUserRoutes(app, users);
+  registerFieldTypeRoutes(app);
   registerTableRoutes(app, tables);
   registerQueryRoutes(app, tables, options.queryRouteOptions);
   registerIngestRoutes(app, tables);

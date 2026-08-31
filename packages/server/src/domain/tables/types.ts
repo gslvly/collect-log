@@ -2,15 +2,19 @@ export const TABLE_STATUSES = ['creating', 'active', 'disabled', 'archived', 'fa
 
 export type TableStatus = (typeof TABLE_STATUSES)[number];
 
-export const FIELD_TYPES = ['string', 'boolean'] as const;
+export const FIELD_TYPES = ['string', 'enum', 'boolean', 'integer', 'float', 'datetime'] as const;
 
 export type FieldType = (typeof FIELD_TYPES)[number];
+
+export const FIELD_OPTION_STATUSES = ['active', 'disabled'] as const;
+
+export type FieldOptionStatus = (typeof FIELD_OPTION_STATUSES)[number];
 
 export const FIELD_STATUSES = ['active', 'deprecated', 'dropped', 'renamed'] as const;
 
 export type FieldStatus = (typeof FIELD_STATUSES)[number];
 
-export interface CreateFieldInput {
+export interface FieldDefinitionInput {
   key: string;
   label: string;
   type: FieldType;
@@ -18,11 +22,23 @@ export interface CreateFieldInput {
   description: string;
 }
 
-export interface ActiveField extends CreateFieldInput {
+export interface FieldOptionInput {
+  value: string;
+  label: string;
+  status: FieldOptionStatus;
+}
+
+export interface CreateFieldInput extends FieldDefinitionInput {
+  options?: FieldOptionInput[] | undefined;
+}
+
+export interface ActiveField extends FieldDefinitionInput {
+  activeOptions: ReadonlyMap<string, string>;
   schemaVersion: number;
 }
 
-export interface FieldRecord extends CreateFieldInput {
+export interface FieldRecord extends FieldDefinitionInput {
+  options: FieldOptionInput[];
   status: FieldStatus;
   renamedTo: string;
   schemaVersion: number;
@@ -34,6 +50,11 @@ export interface UpdateFieldInput {
   label?: string | undefined;
   required?: boolean | undefined;
   description?: string | undefined;
+}
+
+export interface RetypeFieldInput {
+  type: FieldType;
+  options?: FieldOptionInput[] | undefined;
 }
 
 export interface CreateTableInput {
@@ -98,6 +119,10 @@ export function isTableStatus(value: unknown): value is TableStatus {
 
 export function isFieldType(value: unknown): value is FieldType {
   return typeof value === 'string' && FIELD_TYPES.includes(value as FieldType);
+}
+
+export function isFieldOptionStatus(value: unknown): value is FieldOptionStatus {
+  return typeof value === 'string' && FIELD_OPTION_STATUSES.includes(value as FieldOptionStatus);
 }
 
 export function isFieldStatus(value: unknown): value is FieldStatus {

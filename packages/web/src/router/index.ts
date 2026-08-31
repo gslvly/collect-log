@@ -5,10 +5,12 @@ import AppShell from '../layouts/AppShell.vue';
 import { canAccessRoles, type Role } from '../permissions.js';
 import { useAuthStore } from '../stores/auth.js';
 import { pinia } from '../stores/index.js';
-import ForbiddenView from '../views/ForbiddenView.vue';
-import LoginView from '../views/LoginView.vue';
-import PlaceholderView from '../views/PlaceholderView.vue';
-import TablesView from '../views/TablesView.vue';
+import ForbiddenView from '../views/ForbiddenView/ForbiddenView.vue';
+import LoginView from '../views/LoginView/LoginView.vue';
+import PlaceholderView from '../views/PlaceholderView/PlaceholderView.vue';
+import QueryView from '../views/QueryView/QueryView.vue';
+import TableDetailView from '../views/TableDetailView/TableDetailView.vue';
+import TablesView from '../views/TablesView/TablesView.vue';
 
 declare module 'vue-router' {
   interface RouteMeta {
@@ -45,19 +47,20 @@ const routes = [
       {
         path: 'tables/:projectId',
         name: 'table-detail',
-        component: PlaceholderView,
+        component: TableDetailView,
         meta: { title: '数据采集表详情' },
       },
       {
         path: 'query',
         name: 'query',
-        component: PlaceholderView,
+        component: QueryView,
         meta: { title: '数据明细查询' },
       },
       {
+        // 统计页把 ECharts 拉进依赖树，单独切一个 chunk，避免其余页面为它买单。
         path: 'statistics',
         name: 'statistics',
-        component: PlaceholderView,
+        component: () => import('../views/StatisticsView/StatisticsView.vue'),
         meta: { title: '统计分析' },
       },
       {

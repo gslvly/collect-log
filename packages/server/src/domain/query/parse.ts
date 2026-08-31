@@ -1,13 +1,17 @@
 import { z } from 'zod';
 
 import { AppError } from '../../errors.js';
-import type {
-  Condition,
-  DetailQueryInput,
-  ExportInput,
-  QueryLimits,
-  StatisticsInput,
-  TimeRange,
+import { FIELD_MEASURES, measureRequiresField } from '../field-types.js';
+import {
+  OCCURRED_AT_AXIS,
+  type Condition,
+  type DetailQueryInput,
+  type ExportInput,
+  type QueryLimits,
+  type StatisticsDimension,
+  type StatisticsInput,
+  type StatisticsMeasure,
+  type TimeRange,
 } from './types.js';
 
 const PROJECT_ID_PATTERN = /^prj_[0-9A-HJKMNP-TV-Z]{26}$/;
@@ -39,10 +43,18 @@ const conditionSchema: z.ZodType<Condition> = z.lazy(() =>
           'not_in',
           'contains',
           'not_contains',
+          'is_empty',
+          'is_not_empty',
+          'gt',
+          'gte',
+          'lt',
+          'lte',
           'is_null',
           'is_not_null',
         ]),
-        value: z.union([z.string(), z.array(z.string()), z.boolean()]).optional(),
+        value: z
+          .union([z.string(), z.array(z.string()), z.number(), z.array(z.number()), z.boolean()])
+          .optional(),
       })
       .strict(),
   ]),
@@ -52,9 +64,30 @@ const detailQuerySchema = z
   .object({
     range: z.unknown(),
     filter: conditionSchema.optional(),
+    includeFields: z.array(z.string()).optional(),
     limit: z.number().int().optional(),
     order: z.enum(['asc', 'desc']).optional(),
     cursor: z.string().min(1).optional(),
+  })
+  .strict();
+
+// DESIGN 9.4.1：两种 kind 的可选键不同，但故意收在同一个 schema 里 ——
+// 让「时间维度带了 limit」这类错误由下面的 parseDimension 给出指名道姓的说明，
+// 而不是被 Zod 的判别联合吞成笼统的 "does not match the expected shape"。
+const dimensionSchema = z
+  .object({
+    kind: z.enum(['time', 'field']),
+    axis: z.string().optional(),
+    granularity: z.enum(['minute', 'hour', 'day']).optional(),
+    field: z.string().optional(),
+    limit: z.number().int().optional(),
+  })
+  .strict();
+
+const measureSchema = z
+  .object({
+    fn: z.enum(FIELD_MEASURES),
+    field: z.string().optional(),
   })
   .strict();
 
@@ -65,10 +98,8 @@ const statisticsSchema = z
     // tz 故意放成 unknown：缺失 / 空串 / 偏移形式都要由 assertValidTimeZone 给出
     // 指名道姓的报错，而不是被 Zod 吞成笼统的 "does not match the expected shape"。
     tz: z.unknown().optional(),
-    metric: z.enum(['total', 'trend', 'unique', 'group', 'boolean_ratio']),
-    granularity: z.enum(['minute', 'hour', 'day']).optional(),
-    field: z.string().optional(),
-    limit: z.number().int().optional(),
+    dimension: dimensionSchema.nullable().optional(),
+    measure: measureSchema,
   })
   .strict();
 
@@ -76,6 +107,7 @@ const exportSchema = z
   .object({
     range: z.unknown(),
     filter: conditionSchema.optional(),
+    includeFields: z.array(z.string()).optional(),
     order: z.enum(['asc', 'desc']).optional(),
   })
   .strict();
@@ -123,6 +155,10 @@ function parseShape<T>(schema: z.ZodType<T>, input: unknown, subject: string): T
   return parsed.data;
 }
 
+function normalizeIncludeFields(includeFields: readonly string[] | undefined): string[] {
+  return [...new Set(includeFields ?? [])].sort();
+}
+
 export function parseDetailQuery(input: unknown, limits: QueryLimits): DetailQueryInput {
   const parsed = parseShape(detailQuerySchema, input, 'Detail query');
   const range = parseTimeRange(parsed.range, limits.maxRangeDays);
@@ -133,6 +169,7 @@ export function parseDetailQuery(input: unknown, limits: QueryLimits): DetailQue
   return {
     range,
     ...(parsed.filter === undefined ? {} : { filter: parsed.filter }),
+    includeFields: normalizeIncludeFields(parsed.includeFields),
     limit,
     order: parsed.order ?? 'desc',
     ...(parsed.cursor === undefined ? {} : { cursor: parsed.cursor }),
@@ -183,45 +220,78 @@ export function assertTrendRange(range: TimeRange, granularity: 'minute' | 'hour
   }
 }
 
+type RawDimension = z.infer<typeof dimensionSchema>;
+type RawMeasure = z.infer<typeof measureSchema>;
+
+function parseDimension(
+  raw: RawDimension | null | undefined,
+  range: TimeRange,
+  limits: QueryLimits,
+): StatisticsDimension | undefined {
+  // DESIGN 9.4.1：省略 / null 都表示「不分组，返回单个值」。
+  if (raw === undefined || raw === null) {
+    return undefined;
+  }
+
+  if (raw.kind === 'time') {
+    if (raw.field !== undefined) {
+      return invalidQuery('Time dimension takes "axis", not "field"');
+    }
+    // DESIGN 9.4.1：桶数已被「跨度 × 粒度」限死，再给一个 limit 只会截出一段没头没尾的时间轴。
+    if (raw.limit !== undefined) {
+      return invalidQuery(
+        'Time dimension does not accept "limit"; the bucket count is already bounded by the time range and granularity',
+      );
+    }
+    if (raw.granularity === undefined) {
+      return invalidQuery('Time dimension requires a granularity of "minute", "hour", or "day"');
+    }
+    assertTrendRange(range, raw.granularity);
+    return { kind: 'time', axis: raw.axis ?? OCCURRED_AT_AXIS, granularity: raw.granularity };
+  }
+
+  if (raw.axis !== undefined || raw.granularity !== undefined) {
+    return invalidQuery('Field dimension does not accept "axis" or "granularity"');
+  }
+  if (raw.field === undefined) {
+    return invalidQuery('Field dimension requires a field');
+  }
+  const limit = raw.limit ?? limits.defaultGroupLimit;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > limits.maxGroupLimit) {
+    return invalidQuery(`Group limit must be between 1 and ${limits.maxGroupLimit}`);
+  }
+  return { kind: 'field', field: raw.field, limit };
+}
+
+function parseMeasure(raw: RawMeasure): StatisticsMeasure {
+  if (!measureRequiresField(raw.fn)) {
+    // DESIGN 9.4.2：想要「该字段非空的行数」请用 unique 或加一个 is_not_null 条件，
+    // 不要让 count 有两种含义。
+    if (raw.field !== undefined) {
+      return invalidQuery(
+        `Measure "${raw.fn}" does not accept a field; use "unique" or an is_not_null filter to count rows that carry a field`,
+      );
+    }
+    return { fn: raw.fn };
+  }
+  if (raw.field === undefined) {
+    return invalidQuery(`Measure "${raw.fn}" requires a field`);
+  }
+  return { fn: raw.fn, field: raw.field };
+}
+
 export function parseStatisticsQuery(input: unknown, limits: QueryLimits): StatisticsInput {
   const parsed = parseShape(statisticsSchema, input, 'Statistics query');
   const range = parseTimeRange(parsed.range, limits.maxRangeDays);
   const tz = assertValidTimeZone(parsed.tz);
-
-  if (parsed.metric === 'trend') {
-    if (parsed.granularity === undefined) {
-      return invalidQuery('Granularity is required for trend statistics');
-    }
-    assertTrendRange(range, parsed.granularity);
-  } else if (parsed.granularity !== undefined) {
-    return invalidQuery('Granularity is only supported for trend statistics');
-  }
-
-  if (['unique', 'group', 'boolean_ratio'].includes(parsed.metric) && parsed.field === undefined) {
-    return invalidQuery(`Field is required for ${parsed.metric} statistics`);
-  }
-  if (!['unique', 'group', 'boolean_ratio'].includes(parsed.metric) && parsed.field !== undefined) {
-    return invalidQuery(`Field is not supported for ${parsed.metric} statistics`);
-  }
-
-  let limit = parsed.limit;
-  if (parsed.metric === 'group') {
-    limit ??= 50;
-    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) {
-      return invalidQuery('Group limit must be between 1 and 500');
-    }
-  } else if (limit !== undefined) {
-    return invalidQuery('Limit is only supported for group statistics');
-  }
+  const dimension = parseDimension(parsed.dimension, range, limits);
 
   return {
     range,
     ...(parsed.filter === undefined ? {} : { filter: parsed.filter }),
     tz,
-    metric: parsed.metric,
-    ...(parsed.granularity === undefined ? {} : { granularity: parsed.granularity }),
-    ...(parsed.field === undefined ? {} : { field: parsed.field }),
-    ...(limit === undefined ? {} : { limit }),
+    ...(dimension === undefined ? {} : { dimension }),
+    measure: parseMeasure(parsed.measure),
   };
 }
 
@@ -230,6 +300,7 @@ export function parseExportQuery(input: unknown, limits: QueryLimits): ExportInp
   return {
     range: parseTimeRange(parsed.range, limits.maxRangeDays),
     ...(parsed.filter === undefined ? {} : { filter: parsed.filter }),
+    includeFields: normalizeIncludeFields(parsed.includeFields),
     order: parsed.order ?? 'desc',
   };
 }

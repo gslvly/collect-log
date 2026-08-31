@@ -9,6 +9,7 @@ export const ERROR_CODES = [
   'DEPRECATED_FIELD',
   'REQUIRED_FIELD_MISSING',
   'INVALID_FIELD_TYPE',
+  'INVALID_FIELD_VALUE',
   'FIELD_VALUE_TOO_LONG',
   'TOO_MANY_FIELDS',
   'INVALID_QUERY',
@@ -53,6 +54,7 @@ export const ERROR_HTTP_STATUS: Record<ErrorCode, number> = {
   DEPRECATED_FIELD: 400,
   REQUIRED_FIELD_MISSING: 400,
   INVALID_FIELD_TYPE: 400,
+  INVALID_FIELD_VALUE: 400,
   FIELD_VALUE_TOO_LONG: 400,
   TOO_MANY_FIELDS: 400,
   INVALID_QUERY: 400,
@@ -90,6 +92,7 @@ export interface ExpectedField {
   type: string;
   required: boolean;
   description?: string;
+  options?: string[];
 }
 
 export interface AppErrorDetails {

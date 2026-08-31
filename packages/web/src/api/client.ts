@@ -10,6 +10,26 @@ interface RequestJsonOptions {
   skipAuthFailureHandling?: boolean;
 }
 
+interface DownloadExportOptions {
+  body: unknown;
+  filename: string;
+  headers?: HeadersInit;
+  signal?: AbortSignal;
+}
+
+export type DownloadExportResult =
+  { status: 'cancelled' } | { status: 'success' | 'truncated'; filename: string };
+
+export const FILE_SYSTEM_EXPORT_UNAVAILABLE_MESSAGE =
+  'CSV 导出需要 Chrome 或 Edge，且需通过 HTTPS 或 localhost 访问。';
+
+export class FileSystemExportUnavailableError extends Error {
+  constructor() {
+    super(FILE_SYSTEM_EXPORT_UNAVAILABLE_MESSAGE);
+    this.name = 'FileSystemExportUnavailableError';
+  }
+}
+
 interface ServerErrorPayload {
   success: false;
   error: {
@@ -92,12 +112,35 @@ function handleSessionInvalid(code: string, skip: boolean): void {
   sessionInvalidHandler?.();
 }
 
-export async function requestJson<T>(path: string, options: RequestJsonOptions = {}): Promise<T> {
+function toApiError(
+  serverError: ServerErrorPayload,
+  httpStatus: number,
+  skipAuthFailureHandling: boolean,
+): ApiError {
+  handleSessionInvalid(serverError.error.code, skipAuthFailureHandling);
+  return new ApiError(serverError.error.message, {
+    code: serverError.error.code,
+    httpStatus,
+    requestId: serverError.requestId,
+    ...(serverError.error.field === undefined ? {} : { field: serverError.error.field }),
+    ...(serverError.error.expected === undefined ? {} : { expected: serverError.error.expected }),
+    ...(serverError.error.schemaVersion === undefined
+      ? {}
+      : { schemaVersion: serverError.error.schemaVersion }),
+  });
+}
+
+function authenticatedHeaders(headersInit?: HeadersInit): Headers {
   const authStore = useAuthStore(pinia);
-  const headers = new Headers(options.headers);
+  const headers = new Headers(headersInit);
   if (authStore.token !== null) {
     headers.set('Authorization', `Bearer ${authStore.token}`);
   }
+  return headers;
+}
+
+export async function requestJson<T>(path: string, options: RequestJsonOptions = {}): Promise<T> {
+  const headers = authenticatedHeaders(options.headers);
   if (options.body !== undefined) {
     headers.set('Content-Type', 'application/json');
   }
@@ -123,17 +166,7 @@ export async function requestJson<T>(path: string, options: RequestJsonOptions =
 
   const serverError = parseServerError(payload);
   if (serverError !== null) {
-    handleSessionInvalid(serverError.error.code, options.skipAuthFailureHandling === true);
-    throw new ApiError(serverError.error.message, {
-      code: serverError.error.code,
-      httpStatus: response.status,
-      requestId: serverError.requestId,
-      ...(serverError.error.field === undefined ? {} : { field: serverError.error.field }),
-      ...(serverError.error.expected === undefined ? {} : { expected: serverError.error.expected }),
-      ...(serverError.error.schemaVersion === undefined
-        ? {}
-        : { schemaVersion: serverError.error.schemaVersion }),
-    });
+    throw toApiError(serverError, response.status, options.skipAuthFailureHandling === true);
   }
 
   if (!response.ok || !isRecord(payload)) {
@@ -141,4 +174,69 @@ export async function requestJson<T>(path: string, options: RequestJsonOptions =
   }
 
   return payload as T;
+}
+
+export async function downloadExport(
+  path: string,
+  options: DownloadExportOptions,
+): Promise<DownloadExportResult> {
+  if (typeof window.showSaveFilePicker !== 'function' || window.isSecureContext === false) {
+    throw new FileSystemExportUnavailableError();
+  }
+
+  let fileHandle: FileSystemFileHandle;
+  try {
+    fileHandle = await window.showSaveFilePicker({ suggestedName: options.filename });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      return { status: 'cancelled' };
+    }
+    throw error;
+  }
+
+  const headers = authenticatedHeaders(options.headers);
+  headers.set('Content-Type', 'application/json');
+
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(options.body),
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+    });
+  } catch {
+    throw networkError(0);
+  }
+
+  if (!response.ok) {
+    let payload: unknown;
+    try {
+      payload = await response.json();
+    } catch {
+      throw networkError(response.status, 'Server returned a non-JSON response');
+    }
+    const serverError = parseServerError(payload);
+    if (serverError !== null) {
+      throw toApiError(serverError, response.status, false);
+    }
+    throw networkError(response.status, 'Server returned an unexpected response');
+  }
+
+  const truncated = response.headers.get('x-export-truncated') === '1';
+  if (response.body === null) {
+    throw networkError(response.status, 'Server returned an empty export response');
+  }
+
+  try {
+    const writable = await fileHandle.createWritable();
+    await response.body.pipeTo(writable);
+  } catch {
+    throw networkError(response.status, 'Failed to write the export file');
+  }
+
+  return {
+    status: truncated ? 'truncated' : 'success',
+    filename: options.filename,
+  };
 }

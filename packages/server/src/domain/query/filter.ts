@@ -1,6 +1,9 @@
+import { configuredLimits } from '../../config/limits.js';
 import { AppError } from '../../errors.js';
+import { fieldTypeSupportsOperator, type FieldOperator } from '../field-types.js';
+import { formatOccurredAt } from '../ingest/writer.js';
 import { assertValidFieldKey } from '../tables/schema.js';
-import type { ActiveField } from '../tables/types.js';
+import type { ActiveField, FieldType } from '../tables/types.js';
 import type { Condition, FilterSql, QueryLimits } from './types.js';
 
 interface FilterBuildState {
@@ -9,27 +12,58 @@ interface FilterBuildState {
   params: Record<string, unknown>;
 }
 
-const STRING_OPERATORS = new Set([
-  'eq',
-  'neq',
-  'in',
-  'not_in',
-  'contains',
-  'not_contains',
-  'is_null',
-  'is_not_null',
-]);
-const BOOLEAN_OPERATORS = new Set(['eq', 'is_null', 'is_not_null']);
+type ParameterType = 'String' | 'Bool' | 'Int64' | 'Float64' | "DateTime64(3, 'UTC')";
 
 function invalidQuery(message: string): never {
   throw new AppError('INVALID_QUERY', message);
 }
 
-function parameter(state: FilterBuildState, value: unknown, type: 'String' | 'Bool'): string {
+function parameter(state: FilterBuildState, value: unknown, type: ParameterType): string {
   const name = `p${state.parameterIndex}`;
   state.parameterIndex += 1;
   state.params[name] = value;
   return `{${name}:${type}}`;
+}
+
+function isValidScalar(value: unknown, fieldType: FieldType): value is string | number | boolean {
+  if (fieldType === 'string' || fieldType === 'enum') {
+    return typeof value === 'string';
+  }
+  if (fieldType === 'boolean') {
+    return typeof value === 'boolean';
+  }
+  if (fieldType === 'integer') {
+    return Number.isSafeInteger(value);
+  }
+  if (fieldType === 'float') {
+    return typeof value === 'number' && Number.isFinite(value);
+  }
+  return (
+    typeof value === 'number' &&
+    Number.isInteger(value) &&
+    value >= configuredLimits.ingest.datetimeMinMs &&
+    value <= configuredLimits.ingest.datetimeMaxMs
+  );
+}
+
+function fieldParameter(
+  state: FilterBuildState,
+  value: string | number | boolean,
+  fieldType: FieldType,
+): string {
+  if (fieldType === 'string' || fieldType === 'enum') {
+    return parameter(state, value, 'String');
+  }
+  if (fieldType === 'boolean') {
+    return parameter(state, value, 'Bool');
+  }
+  if (fieldType === 'integer') {
+    return parameter(state, value, 'Int64');
+  }
+  if (fieldType === 'datetime') {
+    return parameter(state, formatOccurredAt(value as number), "DateTime64(3, 'UTC')");
+  }
+  return parameter(state, value, 'Float64');
 }
 
 function requireField(fieldKey: string, fields: ReadonlyMap<string, ActiveField>): ActiveField {
@@ -57,66 +91,94 @@ function assertNoValue(condition: Extract<Condition, { field: string }>): void {
   }
 }
 
-function buildStringLeaf(
+function scalarValue(
   condition: Extract<Condition, { field: string }>,
-  safeField: string,
+  field: ActiveField,
+): string | number | boolean {
+  if (!isValidScalar(condition.value, field.type)) {
+    return invalidQuery(
+      `Operator "${condition.op}" requires a valid ${field.type} value for field "${field.key}"`,
+    );
+  }
+  return condition.value;
+}
+
+function scalarArray(
+  condition: Extract<Condition, { field: string }>,
+  field: ActiveField,
+): Array<string | number | boolean> {
+  if (
+    !Array.isArray(condition.value) ||
+    condition.value.length === 0 ||
+    !condition.value.every((value) => isValidScalar(value, field.type))
+  ) {
+    return invalidQuery(
+      `Operator "${condition.op}" requires a non-empty ${field.type} array for field "${field.key}"`,
+    );
+  }
+  return condition.value;
+}
+
+function buildLeaf(
+  condition: Extract<Condition, { field: string }>,
+  field: ActiveField,
   state: FilterBuildState,
   limits: QueryLimits,
 ): string {
-  const column = `\`${safeField}\``;
-  switch (condition.op) {
-    case 'eq': {
-      if (typeof condition.value !== 'string') {
-        return invalidQuery(`Operator "eq" requires a string value for field "${safeField}"`);
-      }
+  const column = `\`${field.key}\``;
+  const operator: FieldOperator = condition.op;
+  if (!fieldTypeSupportsOperator(field.type, operator)) {
+    return invalidQuery(
+      `Operator "${operator}" is not supported for ${field.type} field "${field.key}"`,
+    );
+  }
+
+  switch (operator) {
+    case 'eq':
+    case 'neq':
+    case 'gt':
+    case 'gte':
+    case 'lt':
+    case 'lte': {
+      const value = scalarValue(condition, field);
       addConditionCost(state, 1, limits);
-      return `${column} = ${parameter(state, condition.value, 'String')}`;
-    }
-    case 'neq': {
-      if (typeof condition.value !== 'string') {
-        return invalidQuery(`Operator "neq" requires a string value for field "${safeField}"`);
-      }
-      addConditionCost(state, 1, limits);
-      return `(${column} IS NULL OR ${column} != ${parameter(state, condition.value, 'String')})`;
+      const comparison = {
+        eq: '=',
+        neq: '!=',
+        gt: '>',
+        gte: '>=',
+        lt: '<',
+        lte: '<=',
+      }[operator];
+      const expression = `${column} ${comparison} ${fieldParameter(state, value, field.type)}`;
+      return operator === 'neq' ? `(${column} IS NULL OR ${expression})` : expression;
     }
     case 'in':
     case 'not_in': {
-      if (
-        !Array.isArray(condition.value) ||
-        condition.value.length === 0 ||
-        !condition.value.every((value) => typeof value === 'string')
-      ) {
-        return invalidQuery(
-          `Operator "${condition.op}" requires a non-empty string array for field "${safeField}"`,
-        );
-      }
-      addConditionCost(state, condition.value.length, limits);
-      const values = condition.value.map((value) => parameter(state, value, 'String')).join(', ');
-      if (condition.op === 'not_in') {
-        return `(${column} IS NULL OR ${column} NOT IN (${values}))`;
-      }
-      return `${column} IN (${values})`;
+      const values = scalarArray(condition, field);
+      addConditionCost(state, values.length, limits);
+      const parameters = values.map((value) => fieldParameter(state, value, field.type)).join(', ');
+      return operator === 'not_in'
+        ? `(${column} IS NULL OR ${column} NOT IN (${parameters}))`
+        : `${column} IN (${parameters})`;
     }
-    case 'contains': {
-      if (typeof condition.value !== 'string') {
-        return invalidQuery(`Operator "contains" requires a string value for field "${safeField}"`);
-      }
-      addConditionCost(state, 1, limits);
-      return `position(${column}, ${parameter(state, condition.value, 'String')}) > 0`;
-    }
+    case 'contains':
     case 'not_contains': {
-      if (typeof condition.value !== 'string') {
-        return invalidQuery(
-          `Operator "not_contains" requires a string value for field "${safeField}"`,
-        );
-      }
+      const value = scalarValue(condition, field);
       addConditionCost(state, 1, limits);
-      return `(${column} IS NULL OR position(${column}, ${parameter(
-        state,
-        condition.value,
-        'String',
-      )}) = 0)`;
+      const expression = `position(${column}, ${fieldParameter(state, value, field.type)})`;
+      return operator === 'not_contains'
+        ? `(${column} IS NULL OR ${expression} = 0)`
+        : `${expression} > 0`;
     }
+    case 'is_empty':
+      assertNoValue(condition);
+      addConditionCost(state, 1, limits);
+      return `${column} = ''`;
+    case 'is_not_empty':
+      assertNoValue(condition);
+      addConditionCost(state, 1, limits);
+      return `(${column} IS NOT NULL AND ${column} != '')`;
     case 'is_null':
       assertNoValue(condition);
       addConditionCost(state, 1, limits);
@@ -125,40 +187,6 @@ function buildStringLeaf(
       assertNoValue(condition);
       addConditionCost(state, 1, limits);
       return `${column} IS NOT NULL`;
-  }
-}
-
-function buildBooleanLeaf(
-  condition: Extract<Condition, { field: string }>,
-  safeField: string,
-  state: FilterBuildState,
-  limits: QueryLimits,
-): string {
-  const column = `\`${safeField}\``;
-  if (!BOOLEAN_OPERATORS.has(condition.op)) {
-    return invalidQuery(
-      `Operator "${condition.op}" is not supported for boolean field "${safeField}"`,
-    );
-  }
-  switch (condition.op) {
-    case 'eq':
-      if (typeof condition.value !== 'boolean') {
-        return invalidQuery(`Operator "eq" requires a boolean value for field "${safeField}"`);
-      }
-      addConditionCost(state, 1, limits);
-      return `${column} = ${parameter(state, condition.value, 'Bool')}`;
-    case 'is_null':
-      assertNoValue(condition);
-      addConditionCost(state, 1, limits);
-      return `${column} IS NULL`;
-    case 'is_not_null':
-      assertNoValue(condition);
-      addConditionCost(state, 1, limits);
-      return `${column} IS NOT NULL`;
-    default:
-      return invalidQuery(
-        `Operator "${condition.op}" is not supported for boolean field "${safeField}"`,
-      );
   }
 }
 
@@ -184,15 +212,7 @@ function buildCondition(
   }
 
   const field = requireField(condition.field, fields);
-  if (field.type === 'string') {
-    if (!STRING_OPERATORS.has(condition.op)) {
-      return invalidQuery(
-        `Operator "${condition.op}" is not supported for string field "${field.key}"`,
-      );
-    }
-    return buildStringLeaf(condition, field.key, state, limits);
-  }
-  return buildBooleanLeaf(condition, field.key, state, limits);
+  return buildLeaf(condition, field, state, limits);
 }
 
 export function buildFilterSql(

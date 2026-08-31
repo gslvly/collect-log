@@ -1,14 +1,14 @@
 <script setup lang="ts">
 import type { FormInstance, FormRules } from 'element-plus';
 import { ElMessage } from 'element-plus';
-import { computed, reactive, ref } from 'vue';
+import { computed, onMounted, reactive, ref } from 'vue';
 import { RouterView, useRoute, useRouter } from 'vue-router';
 
 import { changePassword } from '../api/auth.js';
 import { getApiErrorMessage } from '../api/errors.js';
 import { can, type Permission, type Role } from '../permissions.js';
 import { useAuthStore } from '../stores/auth.js';
-import { getSupportedTimeZones, useTimezoneStore } from '../stores/timezone.js';
+import { useFieldTypesStore } from '../stores/field-types.js';
 
 interface NavigationItem {
   label: string;
@@ -40,8 +40,7 @@ const roleLabels: Record<Role, string> = {
 const route = useRoute();
 const router = useRouter();
 const authStore = useAuthStore();
-const timezoneStore = useTimezoneStore();
-const timeZoneOptions = getSupportedTimeZones(timezoneStore.timeZone);
+const fieldTypesStore = useFieldTypesStore();
 const passwordDialogVisible = ref(false);
 const passwordSubmitting = ref(false);
 const passwordFormRef = ref<FormInstance>();
@@ -85,10 +84,6 @@ const passwordRules: FormRules<PasswordForm> = {
   ],
 };
 
-function handleTimeZoneChange(value: string): void {
-  timezoneStore.setTimeZone(value);
-}
-
 function resetPasswordForm(): void {
   passwordForm.currentPassword = '';
   passwordForm.newPassword = '';
@@ -129,6 +124,12 @@ async function handleLogout(): Promise<void> {
     await router.replace({ name: 'login' });
   }
 }
+
+onMounted(() => {
+  void fieldTypesStore.load().catch(() => {
+    // Pages that need the matrix expose their own retry state.
+  });
+});
 </script>
 
 <template>
@@ -155,24 +156,6 @@ async function handleLogout(): Promise<void> {
         </div>
 
         <div class="topbar-actions">
-          <div class="timezone-control">
-            <span>时区</span>
-            <el-select
-              :model-value="timezoneStore.timeZone"
-              filterable
-              size="default"
-              aria-label="全局时区"
-              @change="handleTimeZoneChange"
-            >
-              <el-option
-                v-for="timeZone in timeZoneOptions"
-                :key="timeZone"
-                :label="timeZone"
-                :value="timeZone"
-              />
-            </el-select>
-          </div>
-
           <el-dropdown trigger="click">
             <button class="user-menu-button" type="button">
               <span class="avatar">{{ authStore.user?.username.slice(0, 1).toUpperCase() }}</span>
@@ -311,11 +294,12 @@ async function handleLogout(): Promise<void> {
 }
 
 .nav-marker {
-  display: inline-grid;
+  display: inline-flex;
   width: 25px;
   height: 25px;
   margin-right: 11px;
-  place-items: center;
+  align-items: center;
+  justify-content: center;
   font-size: 11px;
   font-weight: 700;
   border: 1px solid currentcolor;
@@ -361,7 +345,6 @@ async function handleLogout(): Promise<void> {
 }
 
 .topbar-actions,
-.timezone-control,
 .user-menu-button {
   display: flex;
   align-items: center;
@@ -369,16 +352,6 @@ async function handleLogout(): Promise<void> {
 
 .topbar-actions {
   gap: 24px;
-}
-
-.timezone-control {
-  gap: 9px;
-  font-size: 13px;
-  color: #718096;
-}
-
-.timezone-control :deep(.el-select) {
-  width: 190px;
 }
 
 .user-menu-button {
@@ -462,14 +435,9 @@ async function handleLogout(): Promise<void> {
     margin-left: 76px;
   }
 
-  .timezone-control > span,
   .user-copy,
   .chevron {
     display: none;
-  }
-
-  .timezone-control :deep(.el-select) {
-    width: 150px;
   }
 }
 
@@ -477,11 +445,6 @@ async function handleLogout(): Promise<void> {
   .topbar {
     padding: 0 16px;
   }
-
-  .timezone-control :deep(.el-select) {
-    width: 118px;
-  }
-
   .content-area {
     padding: 16px;
   }

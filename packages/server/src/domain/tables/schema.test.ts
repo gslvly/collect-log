@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import { configuredLimits } from '../../config/limits.js';
 import {
   assertValidFieldKey,
   buildPhysicalTableDdl,
@@ -26,30 +27,90 @@ describe('collection table schema', () => {
   });
 
   it('enforces the configured field limit', () => {
-    expect(() => validateInitialFields([field('one'), field('two')], 1)).toThrow(
-      expect.objectContaining({ code: 'TOO_MANY_FIELDS' }),
-    );
+    expect(() =>
+      validateInitialFields([field('one'), field('two')], {
+        ...configuredLimits.schema,
+        maxFieldsPerTable: 1,
+      }),
+    ).toThrow(expect.objectContaining({ code: 'TOO_MANY_FIELDS' }));
   });
 
   it('rejects duplicate field keys inside a single create request', () => {
-    expect(() => validateInitialFields([field('dup'), field('dup')], 10)).toThrow(
-      expect.objectContaining({ code: 'FIELD_KEY_EXISTS' }),
+    expect(() =>
+      validateInitialFields([field('dup'), field('dup')], configuredLimits.schema),
+    ).toThrow(expect.objectContaining({ code: 'FIELD_KEY_EXISTS' }));
+  });
+
+  it('maps every field type to its nullable ClickHouse type', () => {
+    expect(physicalTypeFor('string')).toBe('Nullable(String)');
+    expect(physicalTypeFor('enum')).toBe('LowCardinality(Nullable(String))');
+    expect(physicalTypeFor('boolean')).toBe('Nullable(Bool)');
+    expect(physicalTypeFor('integer')).toBe('Nullable(Int64)');
+    expect(physicalTypeFor('float')).toBe('Nullable(Float64)');
+    expect(physicalTypeFor('datetime')).toBe("Nullable(DateTime64(3, 'UTC'))");
+    expect(() => physicalTypeFor('decimal' as FieldType)).toThrow(
+      expect.objectContaining({ code: 'INVALID_JSON' }),
     );
   });
 
-  it('maps only string and boolean to their nullable ClickHouse types', () => {
-    expect(physicalTypeFor('string')).toBe('Nullable(String)');
-    expect(physicalTypeFor('boolean')).toBe('Nullable(Bool)');
-    expect(() => physicalTypeFor('number' as FieldType)).toThrow(
-      expect.objectContaining({ code: 'INVALID_JSON' }),
-    );
+  it('requires active options only for enum fields', () => {
+    const activeOption = { value: 'wechat', label: '微信', status: 'active' as const };
+    expect(() =>
+      validateInitialFields(
+        [{ ...field('channel', 'enum'), options: [activeOption] }],
+        configuredLimits.schema,
+      ),
+    ).not.toThrow();
+
+    for (const invalid of [
+      field('channel', 'enum'),
+      {
+        ...field('channel', 'enum'),
+        options: [{ ...activeOption, status: 'disabled' as const }],
+      },
+      { ...field('event_name'), options: [activeOption] },
+      { ...field('channel', 'enum'), options: [activeOption, activeOption] },
+    ]) {
+      expect(() => validateInitialFields([invalid], configuredLimits.schema)).toThrow(
+        expect.objectContaining({ code: 'INVALID_FIELD_VALUE' }),
+      );
+    }
+  });
+
+  it('enforces configured enum option count, value bytes and label bytes', () => {
+    const option = (value: string, label: string) => ({
+      value,
+      label,
+      status: 'active' as const,
+    });
+    const schemaLimits = {
+      ...configuredLimits.schema,
+      maxEnumOptions: 2,
+      maxOptionValueBytes: 3,
+      maxOptionLabelBytes: 3,
+    };
+    const invalidOptions = [
+      [option('a', 'A'), option('b', 'B'), option('c', 'C')],
+      [option('toolong', 'A')],
+      [option('a', '微信')],
+    ];
+
+    for (const options of invalidOptions) {
+      expect(() =>
+        validateInitialFields([{ ...field('channel', 'enum'), options }], schemaLimits),
+      ).toThrow(expect.objectContaining({ code: 'INVALID_FIELD_VALUE', field: 'channel' }));
+    }
   });
 
   it('generates the DESIGN 6.5 physical DDL from validated identifiers', () => {
     expect(
       buildPhysicalTableDdl('collect_a8f31c', [
         field('user_id'),
+        field('channel', 'enum'),
         field('is_new_device', 'boolean'),
+        field('retry_count', 'integer'),
+        field('score', 'float'),
+        field('registered_at', 'datetime'),
       ]),
     ).toBe(`CREATE TABLE IF NOT EXISTS data.collect_a8f31c
 (
@@ -58,7 +119,11 @@ describe('collection table schema', () => {
     \`_occurred_at\`    DateTime64(3, 'UTC'),
     \`_received_at\`    DateTime64(3, 'UTC') DEFAULT now64(3),
     \`user_id\` Nullable(String),
-    \`is_new_device\` Nullable(Bool)
+    \`channel\` LowCardinality(Nullable(String)),
+    \`is_new_device\` Nullable(Bool),
+    \`retry_count\` Nullable(Int64),
+    \`score\` Nullable(Float64),
+    \`registered_at\` Nullable(DateTime64(3, 'UTC'))
 )
 ENGINE = ReplacingMergeTree(_received_at)
 PARTITION BY toYYYYMM(_occurred_at)

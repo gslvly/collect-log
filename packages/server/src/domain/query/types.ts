@@ -1,43 +1,69 @@
 import type { ActiveField, TableDefinition } from '../tables/types.js';
+import type { FieldMeasure, FieldOperator } from '../field-types.js';
 
 export interface TimeRange {
   start: number;
   end: number;
 }
 
-export type LeafOperator =
-  'eq' | 'neq' | 'in' | 'not_in' | 'contains' | 'not_contains' | 'is_null' | 'is_not_null';
+export type LeafOperator = FieldOperator;
 
 export type Condition =
   | { op: 'and' | 'or'; conditions: Condition[] }
-  | { field: string; op: LeafOperator; value?: string | string[] | boolean | undefined };
+  | {
+      field: string;
+      op: LeafOperator;
+      value?: string | string[] | number | number[] | boolean | undefined;
+    };
 
 export type QueryOrder = 'asc' | 'desc';
 
 export interface DetailQueryInput {
   range: TimeRange;
   filter?: Condition | undefined;
+  includeFields: string[];
   limit: number;
   order: QueryOrder;
   cursor?: string | undefined;
 }
 
-export type StatisticsMetric = 'total' | 'trend' | 'unique' | 'group' | 'boolean_ratio';
 export type TrendGranularity = 'minute' | 'hour' | 'day';
 
+/** DESIGN 9.4.1：`_occurred_at` 是默认时间轴，业务时间轴是任意具备 `timeAxis` 能力的字段。 */
+export const OCCURRED_AT_AXIS = '_occurred_at';
+
+export interface StatisticsTimeDimension {
+  kind: 'time';
+  axis: string;
+  granularity: TrendGranularity;
+}
+
+export interface StatisticsFieldDimension {
+  kind: 'field';
+  field: string;
+  limit: number;
+}
+
+export type StatisticsDimension = StatisticsTimeDimension | StatisticsFieldDimension;
+
+export interface StatisticsMeasure {
+  fn: FieldMeasure;
+  field?: string | undefined;
+}
+
+/** DESIGN 9.4：统计只有两个正交的轴，接口不再枚举固定组合。 */
 export interface StatisticsInput {
   range: TimeRange;
   filter?: Condition | undefined;
   tz: string;
-  metric: StatisticsMetric;
-  granularity?: TrendGranularity | undefined;
-  field?: string | undefined;
-  limit?: number | undefined;
+  dimension?: StatisticsDimension | undefined;
+  measure: StatisticsMeasure;
 }
 
 export interface ExportInput {
   range: TimeRange;
   filter?: Condition | undefined;
+  includeFields: string[];
   order: QueryOrder;
 }
 
@@ -49,6 +75,8 @@ export interface QueryLimits {
   maxExecutionTimeSec: number;
   maxMemoryUsageBytes: number;
   maxConcurrent: number;
+  defaultGroupLimit: number;
+  maxGroupLimit: number;
 }
 
 export interface ExportLimits {

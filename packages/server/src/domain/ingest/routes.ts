@@ -162,6 +162,7 @@ export function registerIngestRoutes(
         definition,
         (id) => repository.listFields(id),
         configuredLimits.ingest,
+        configuredLimits.schema,
       );
       const row = buildIngestRow(definition, payload, values);
 

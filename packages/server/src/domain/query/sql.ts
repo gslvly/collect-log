@@ -1,15 +1,24 @@
 import { AppError } from '../../errors.js';
 import { assertIdentifier } from '../../infra/clickhouse.js';
+import {
+  fieldTypeHasCapability,
+  fieldTypeSupportsMeasure,
+  type FieldCapability,
+  type FieldMeasure,
+} from '../field-types.js';
 import { formatOccurredAt } from '../ingest/writer.js';
 import { assertValidFieldKey } from '../tables/schema.js';
 import type { ActiveField, TableDefinition } from '../tables/types.js';
 import { decodeCursor, queryFingerprint } from './cursor.js';
-import type {
-  DetailQueryInput,
-  ExportInput,
-  FilterSql,
-  QueryStatement,
-  StatisticsInput,
+import {
+  OCCURRED_AT_AXIS,
+  type DetailQueryInput,
+  type ExportInput,
+  type FilterSql,
+  type QueryStatement,
+  type StatisticsInput,
+  type StatisticsMeasure,
+  type TrendGranularity,
 } from './types.js';
 
 const SYSTEM_COLUMNS = ['_record_id', '_occurred_at', '_received_at', '_schema_version'] as const;
@@ -27,7 +36,9 @@ function physicalTable(definition: TableDefinition): string {
 }
 
 export function selectedColumns(activeFields: readonly ActiveField[]): string {
-  const businessColumns = activeFields.map((field) => `\`${assertValidFieldKey(field.key)}\``);
+  const businessColumns = [...activeFields]
+    .sort((left, right) => (left.key < right.key ? -1 : left.key > right.key ? 1 : 0))
+    .map((field) => `\`${assertValidFieldKey(field.key)}\``);
   return [...SYSTEM_COLUMNS.map((column) => `\`${column}\``), ...businessColumns].join(', ');
 }
 
@@ -64,35 +75,113 @@ function filteredWhere(
   };
 }
 
-function requireStatisticField(
-  fieldKey: string | undefined,
-  activeFields: readonly ActiveField[],
-  expectedType: 'string' | 'boolean',
-  metric: StatisticsInput['metric'],
+/**
+ * DESIGN 9.4：`dimension.field` / `measure.field` / `axis` 三处直接放行 `deprecated`
+ * （`queryFields` 已经只含 active + deprecated），`dropped` / `renamed` / 未知字段
+ * / `_` 开头的系统列一律 INVALID_QUERY。
+ */
+function requireStatisticsField(
+  fieldKey: string,
+  queryFields: readonly ActiveField[],
 ): ActiveField {
-  if (fieldKey === undefined || fieldKey.startsWith('_')) {
-    return invalidQuery(`Unknown field "${String(fieldKey)}"`);
+  if (fieldKey.startsWith('_')) {
+    return invalidQuery(`Unknown field "${fieldKey}"`);
   }
-  const field = activeFields.find((candidate) => candidate.key === fieldKey);
+  const field = queryFields.find((candidate) => candidate.key === fieldKey);
   if (field === undefined) {
     return invalidQuery(`Unknown field "${fieldKey}"`);
   }
   assertValidFieldKey(field.key);
-  if (field.type !== expectedType) {
-    return invalidQuery(`${metric} statistics require a ${expectedType} field`);
+  return field;
+}
+
+function requireCapableField(
+  fieldKey: string,
+  queryFields: readonly ActiveField[],
+  capability: FieldCapability,
+  purpose: string,
+): ActiveField {
+  const field = requireStatisticsField(fieldKey, queryFields);
+  if (!fieldTypeHasCapability(field.type, capability)) {
+    return invalidQuery(`Field "${field.key}" of type ${field.type} cannot be used ${purpose}`);
   }
   return field;
+}
+
+// DESIGN 9.4.2 的聚合表达式表。能力校验不在这里，统一走 domain/field-types.ts。
+const MEASURE_EXPRESSIONS: Readonly<Record<FieldMeasure, (column: string) => string>> = {
+  count: () => 'count()',
+  unique: (column) => `uniqExact(${column})`,
+  sum: (column) => `sum(${column})`,
+  avg: (column) => `avg(${column})`,
+  min: (column) => `min(${column})`,
+  max: (column) => `max(${column})`,
+  p50: (column) => `quantile(0.5)(${column})`,
+  p90: (column) => `quantile(0.9)(${column})`,
+  p99: (column) => `quantile(0.99)(${column})`,
+};
+
+// DESIGN 9.2：按天 / 按小时带时区，按分钟不带 —— 分钟桶在任何时区下的边界都一致。
+const BUCKET_EXPRESSIONS: Readonly<Record<TrendGranularity, (column: string) => string>> = {
+  day: (column) => `toStartOfDay(${column}, {tz:String})`,
+  hour: (column) => `toStartOfHour(${column}, {tz:String})`,
+  minute: (column) => `toStartOfMinute(${column})`,
+};
+
+const FILL_STEPS: Readonly<Record<TrendGranularity, string>> = {
+  day: 'INTERVAL 1 DAY',
+  hour: 'INTERVAL 1 HOUR',
+  minute: 'INTERVAL 1 MINUTE',
+};
+
+export function statisticsMeasureExpression(
+  measure: StatisticsMeasure,
+  queryFields: readonly ActiveField[],
+): string {
+  if (measure.field === undefined) {
+    return MEASURE_EXPRESSIONS[measure.fn]('');
+  }
+  const field = requireStatisticsField(measure.field, queryFields);
+  if (!fieldTypeSupportsMeasure(field.type, measure.fn)) {
+    return invalidQuery(
+      `Field "${field.key}" of type ${field.type} does not support measure "${measure.fn}"`,
+    );
+  }
+  return MEASURE_EXPRESSIONS[measure.fn](`\`${field.key}\``);
+}
+
+/** `_occurred_at` 是唯一被放行的系统列轴，其余轴必须具备 `timeAxis` 能力（DESIGN 9.4.1）。 */
+export function resolveTimeAxis(
+  axis: string,
+  queryFields: readonly ActiveField[],
+): { column: string; occurredAt: boolean } {
+  if (axis === OCCURRED_AT_AXIS) {
+    return { column: `\`${OCCURRED_AT_AXIS}\``, occurredAt: true };
+  }
+  const field = requireCapableField(axis, queryFields, 'timeAxis', 'as a statistics time axis');
+  return { column: `\`${field.key}\``, occurredAt: false };
+}
+
+export function statisticsMeasureFieldType(
+  measure: StatisticsMeasure,
+  queryFields: readonly ActiveField[],
+): ActiveField['type'] | undefined {
+  return measure.field === undefined
+    ? undefined
+    : queryFields.find((candidate) => candidate.key === measure.field)?.type;
 }
 
 export function buildDetailStatement(
   definition: TableDefinition,
   input: DetailQueryInput,
   filter: FilterSql,
+  selectedFields: readonly ActiveField[] = definition.fields,
 ): DetailStatement {
   const fingerprint = queryFingerprint({
     projectId: definition.projectId,
     range: input.range,
     ...(input.filter === undefined ? {} : { filter: input.filter }),
+    includeFields: input.includeFields,
     order: input.order,
     schemaVersion: definition.schemaVersion,
   });
@@ -110,7 +199,7 @@ export function buildDetailStatement(
   }
   const direction = input.order === 'asc' ? 'ASC' : 'DESC';
   return {
-    query: `SELECT ${selectedColumns(definition.fields)}
+    query: `SELECT ${selectedColumns(selectedFields)}
 FROM ${physicalTable(definition)}
 WHERE ${clauses.join('\n  AND ')}
 ORDER BY \`_occurred_at\` ${direction}, \`_record_id\` ${direction}
@@ -120,87 +209,109 @@ LIMIT {row_limit:UInt32}`,
   };
 }
 
+/**
+ * DESIGN 9.4.3 的三条语句。三者都带 `rows` 列（识别 `WITH FILL` 填出来的空桶 + 显示样本量）。
+ *
+ * 与 9.4.3 的片段相比只多一处：**时间维度也带 `WITH TOTALS`**。9.4.4 的响应形状里
+ * `totals` 是必有项、10.6 又要求结果区把它显示出来，而 `avg` / 分位数的总计无法由各桶推出；
+ * `WITH TOTALS` 让它和分组维度一样在同一次扫描里拿回来，避免 9.4.3 第一条明确反对的第二条查询。
+ */
 export function buildStatisticsStatement(
   definition: TableDefinition,
   input: StatisticsInput,
   filter: FilterSql,
+  queryFields: readonly ActiveField[] = definition.fields,
 ): QueryStatement {
+  const table = physicalTable(definition);
+  const aggregate = statisticsMeasureExpression(input.measure, queryFields);
   const where = filteredWhere(input.range, filter);
   const params: Record<string, unknown> = { ...where.params, tz: input.tz };
-  const table = physicalTable(definition);
+  const clauses = [where.sql];
 
-  if (input.metric === 'total') {
+  if (input.dimension === undefined) {
     return {
-      query: `SELECT count() AS count
+      query: `SELECT ${aggregate} AS value, count() AS rows
 FROM ${table}
-WHERE ${where.sql}`,
+WHERE ${clauses.join('\n  AND ')}`,
       params,
     };
   }
 
-  if (input.metric === 'trend') {
-    const expression =
-      input.granularity === undefined
-        ? undefined
-        : {
-            day: 'toStartOfDay(`_occurred_at`, {tz:String})',
-            hour: 'toStartOfHour(`_occurred_at`, {tz:String})',
-            minute: 'toStartOfMinute(`_occurred_at`)',
-          }[input.granularity];
-    if (expression === undefined) {
-      return invalidQuery('Granularity is required for trend statistics');
-    }
+  if (input.dimension.kind === 'field') {
+    const field = requireCapableField(
+      input.dimension.field,
+      queryFields,
+      'groupable',
+      'as a statistics grouping dimension',
+    );
+    // LIMIT n + 1 是 9.4.4 的截断探测；即便已经过 1..maxGroupLimit 校验也仍然参数化绑定。
+    params.group_limit = input.dimension.limit + 1;
     return {
-      query: `SELECT ${expression} AS bucket,
-  toUnixTimestamp(bucket) AS bucket_seconds,
-  count() AS count
+      query: `SELECT \`${field.key}\` AS key,
+       ${aggregate} AS value,
+       count() AS rows
 FROM ${table}
-WHERE ${where.sql}
-GROUP BY bucket
-ORDER BY bucket ASC`,
-      params,
-    };
-  }
-
-  if (input.metric === 'unique') {
-    const field = requireStatisticField(input.field, definition.fields, 'string', input.metric);
-    const column = `\`${field.key}\``;
-    return {
-      query: `SELECT uniqExact(${column}) AS count
-FROM ${table}
-WHERE ${where.sql}
-  AND ${column} IS NOT NULL
-  AND ${column} != ''`,
-      params,
-    };
-  }
-
-  if (input.metric === 'group') {
-    const field = requireStatisticField(input.field, definition.fields, 'string', input.metric);
-    const column = `\`${field.key}\``;
-    // Top N is bound as UInt32 instead of interpolated, even though it was already validated as 1..500.
-    params.group_limit = input.limit ?? 50;
-    return {
-      query: `SELECT ${column} AS value, count() AS total
-FROM ${table}
-WHERE ${where.sql}
-  AND ${column} IS NOT NULL
-GROUP BY value
-ORDER BY total DESC, value ASC
+WHERE ${clauses.join('\n  AND ')}
+GROUP BY key
+    WITH TOTALS
+ORDER BY value DESC, key ASC
 LIMIT {group_limit:UInt32}`,
       params,
     };
   }
 
-  const field = requireStatisticField(input.field, definition.fields, 'boolean', input.metric);
-  const column = `\`${field.key}\``;
+  const { granularity } = input.dimension;
+  const axis = resolveTimeAxis(input.dimension.axis, queryFields);
+  if (!axis.occurredAt) {
+    // DESIGN 9.4.3 第四条：业务时间轴要挡掉未提交该字段的行，否则它们会挤进一个假桶。
+    clauses.push(`${axis.column} IS NOT NULL`);
+  }
+  // DESIGN 9.4.3 第二条：空桶补零只在 axis = _occurred_at 时做 —— 业务时间可以落在
+  // range 之外的任何地方，起止无从推断。
+  const fill = axis.occurredAt
+    ? `
+WITH FILL FROM ${BUCKET_EXPRESSIONS[granularity]("{start:DateTime64(3, 'UTC')}")}
+             TO ${BUCKET_EXPRESSIONS[granularity]("{end:DateTime64(3, 'UTC')}")}
+           STEP ${FILL_STEPS[granularity]}`
+    : '';
   return {
-    query: `SELECT countIf(${column} = true) AS true_count,
-  countIf(${column} = false) AS false_count,
-  countIf(${column} IS NULL) AS null_count
+    query: `SELECT ${BUCKET_EXPRESSIONS[granularity](axis.column)} AS bucket,
+       ${aggregate} AS value,
+       count() AS rows
 FROM ${table}
-WHERE ${where.sql}`,
+WHERE ${clauses.join('\n  AND ')}
+GROUP BY bucket
+    WITH TOTALS
+ORDER BY bucket${fill}`,
     params,
+  };
+}
+
+/**
+ * DESIGN 9.4.3 第四条 / 9.4.4：业务时间轴被 `IS NOT NULL` 排除掉的行数以 `nullAxisRows` 返回。
+ * 主查询的 `WITH TOTALS` 只覆盖被保留的行，这一格拿不到，因此单独取一次 —— 这与
+ * 9.4.3 第一条反对的「用第二条查询算总计」不是一回事，那条说的是分组占比的分母。
+ */
+export function buildNullAxisRowsStatement(
+  definition: TableDefinition,
+  input: StatisticsInput,
+  filter: FilterSql,
+  queryFields: readonly ActiveField[] = definition.fields,
+): QueryStatement | null {
+  if (input.dimension?.kind !== 'time') {
+    return null;
+  }
+  const axis = resolveTimeAxis(input.dimension.axis, queryFields);
+  if (axis.occurredAt) {
+    return null;
+  }
+  const where = filteredWhere(input.range, filter);
+  return {
+    query: `SELECT count() AS count
+FROM ${physicalTable(definition)}
+WHERE ${where.sql}
+  AND ${axis.column} IS NULL`,
+    params: where.params,
   };
 }
 
@@ -223,11 +334,12 @@ export function buildExportStatement(
   input: ExportInput,
   filter: FilterSql,
   maxRows: number,
+  selectedFields: readonly ActiveField[] = definition.fields,
 ): QueryStatement {
   const where = filteredWhere(input.range, filter);
   const direction = input.order === 'asc' ? 'ASC' : 'DESC';
   return {
-    query: `SELECT ${selectedColumns(definition.fields)}
+    query: `SELECT ${selectedColumns(selectedFields)}
 FROM ${physicalTable(definition)}
 WHERE ${where.sql}
 ORDER BY \`_occurred_at\` ${direction}, \`_record_id\` ${direction}

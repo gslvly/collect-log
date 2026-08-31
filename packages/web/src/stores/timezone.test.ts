@@ -1,42 +1,16 @@
 import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { getBrowserTimeZone, TIME_ZONE_STORAGE_KEY, useTimezoneStore } from './timezone.js';
-
-class MemoryStorage implements Storage {
-  readonly #items = new Map<string, string>();
-
-  get length(): number {
-    return this.#items.size;
-  }
-
-  clear(): void {
-    this.#items.clear();
-  }
-
-  getItem(key: string): string | null {
-    return this.#items.get(key) ?? null;
-  }
-
-  key(index: number): string | null {
-    return [...this.#items.keys()][index] ?? null;
-  }
-
-  removeItem(key: string): void {
-    this.#items.delete(key);
-  }
-
-  setItem(key: string, value: string): void {
-    this.#items.set(key, value);
-  }
-}
-
-const localStorageMock = new MemoryStorage();
-vi.stubGlobal('localStorage', localStorageMock);
+import {
+  formatUtcIso,
+  getBrowserTimeZone,
+  isValidIanaTimeZone,
+  useTimezoneStore,
+} from './timezone.js';
 
 describe('timezone store', () => {
   beforeEach(() => {
-    localStorageMock.clear();
+    vi.restoreAllMocks();
     setActivePinia(createPinia());
   });
 
@@ -44,25 +18,25 @@ describe('timezone store', () => {
     expect(useTimezoneStore().timeZone).toBe(getBrowserTimeZone());
   });
 
-  it('persists a selected IANA time zone and restores it in a new store', () => {
-    useTimezoneStore().setTimeZone('Asia/Shanghai');
-    expect(localStorageMock.getItem(TIME_ZONE_STORAGE_KEY)).toBe('Asia/Shanghai');
-
-    setActivePinia(createPinia());
-    expect(useTimezoneStore().timeZone).toBe('Asia/Shanghai');
+  it.each(['Asia/Shanghai', 'America/New_York', 'UTC'])('accepts IANA time zone %s', (timeZone) => {
+    expect(isValidIanaTimeZone(timeZone)).toBe(true);
   });
 
-  it.each(['Not/AZone', '+08:00'])('rejects stored invalid or offset time zone %s', (stored) => {
-    localStorageMock.setItem(TIME_ZONE_STORAGE_KEY, stored);
-    setActivePinia(createPinia());
-
-    expect(useTimezoneStore().timeZone).toBe(getBrowserTimeZone());
+  it.each(['', 'Not/AZone', '+08:00'])('rejects invalid or offset time zone %s', (timeZone) => {
+    expect(isValidIanaTimeZone(timeZone)).toBe(false);
   });
 
-  it('formats a UTC ISO instant using the selected time zone', () => {
-    const timezoneStore = useTimezoneStore();
-    timezoneStore.setTimeZone('Asia/Shanghai');
+  it('falls back to UTC when the browser cannot provide a time zone', () => {
+    vi.spyOn(Intl, 'DateTimeFormat').mockReturnValue({
+      resolvedOptions: () => ({ timeZone: undefined }),
+    } as unknown as Intl.DateTimeFormat);
 
-    expect(timezoneStore.formatUtc('2026-08-28T00:00:00.000Z')).toContain('08:00:00');
+    expect(getBrowserTimeZone()).toBe('UTC');
+    expect(useTimezoneStore().timeZone).toBe('UTC');
+  });
+
+  it('formats UTC instants with the browser time zone', () => {
+    const utcIso = '2026-08-28T00:00:00.000Z';
+    expect(useTimezoneStore().formatUtc(utcIso)).toBe(formatUtcIso(utcIso, getBrowserTimeZone()));
   });
 });

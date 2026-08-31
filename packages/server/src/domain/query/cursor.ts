@@ -33,6 +33,7 @@ export function queryFingerprint(input: {
   projectId: string;
   range: TimeRange;
   filter?: Condition | undefined;
+  includeFields: readonly string[];
   order: QueryOrder;
   schemaVersion: number;
 }): string {

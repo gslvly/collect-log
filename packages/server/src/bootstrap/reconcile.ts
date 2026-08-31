@@ -1,5 +1,12 @@
 import type { ClickHouseClient } from '@clickhouse/client';
 
+import {
+  addPhysicalColumn,
+  dropPhysicalColumn,
+  isLosslessTextEncodingDrift,
+  listPhysicalColumns,
+  physicalTableExists,
+} from './reconcile-clickhouse.js';
 import { tableRepository, type TableRepository } from '../domain/tables/repository.js';
 import {
   assertValidFieldKey,
@@ -7,18 +14,9 @@ import {
   physicalTypeFor,
 } from '../domain/tables/schema.js';
 import type { FieldRecord, TableRecord, TableStatus } from '../domain/tables/types.js';
-import { assertIdentifier, metaClient, parameterizedQuery } from '../infra/clickhouse.js';
+import { assertIdentifier, metaClient } from '../infra/clickhouse.js';
 import { serial } from '../infra/serial.js';
 import { setReconcileState, type ReconcileResult } from '../reconcile-state.js';
-
-interface SystemTableRow {
-  name: string;
-}
-
-interface SystemColumnRow {
-  name: string;
-  type: string;
-}
 
 export interface ReconcileLogger {
   info(bindings: Record<string, unknown>, message: string): void;
@@ -40,74 +38,11 @@ interface ReconcileContext {
   failed: number;
 }
 
-const INTERNAL_COLUMNS = new Set(['_record_id', '_schema_version', '_occurred_at', '_received_at']);
-
 const silentLogger: ReconcileLogger = {
   info: () => {},
   warn: () => {},
   error: () => {},
 };
-
-async function physicalTableExists(
-  client: ClickHouseClient,
-  physicalName: string,
-): Promise<boolean> {
-  const safePhysicalName = assertIdentifier(physicalName);
-  const rows = await parameterizedQuery<SystemTableRow>({
-    client,
-    query: `SELECT name
-FROM system.tables
-WHERE database = {database:String}
-  AND name = {name:String}`,
-    params: { database: 'data', name: safePhysicalName },
-  });
-  return rows.length > 0;
-}
-
-async function listPhysicalColumns(
-  client: ClickHouseClient,
-  physicalName: string,
-): Promise<Map<string, string>> {
-  const safePhysicalName = assertIdentifier(physicalName);
-  const rows = await parameterizedQuery<SystemColumnRow>({
-    client,
-    query: `SELECT name, type
-FROM system.columns
-WHERE database = {database:String}
-  AND table = {table:String}`,
-    params: { database: 'data', table: safePhysicalName },
-  });
-  return new Map(
-    rows.filter((row) => !INTERNAL_COLUMNS.has(row.name)).map((row) => [row.name, row.type]),
-  );
-}
-
-async function addPhysicalColumn(
-  client: ClickHouseClient,
-  table: TableRecord,
-  field: FieldRecord,
-): Promise<void> {
-  const safePhysicalName = assertIdentifier(table.physicalName);
-  const safeFieldKey = assertValidFieldKey(field.key);
-  const physicalType = physicalTypeFor(field.type);
-  await client.command({
-    query: `ALTER TABLE data.${safePhysicalName}
-ADD COLUMN IF NOT EXISTS \`${safeFieldKey}\` ${physicalType}`,
-  });
-}
-
-async function dropPhysicalColumn(
-  client: ClickHouseClient,
-  table: TableRecord,
-  field: FieldRecord,
-): Promise<void> {
-  const safePhysicalName = assertIdentifier(table.physicalName);
-  const safeFieldKey = assertValidFieldKey(field.key);
-  await client.command({
-    query: `ALTER TABLE data.${safePhysicalName}
-DROP COLUMN IF EXISTS \`${safeFieldKey}\``,
-  });
-}
 
 async function reconcileTableStatuses(context: ReconcileContext): Promise<void> {
   const tables = await context.repository.list();
@@ -300,6 +235,50 @@ async function repairRetiredColumn(
   }
 }
 
+async function repairPhysicalType(
+  context: ReconcileContext,
+  table: TableRecord,
+  field: FieldRecord,
+  actualType: string,
+  expectedType: string,
+): Promise<void> {
+  const safePhysicalName = assertIdentifier(table.physicalName);
+  const safeFieldKey = assertValidFieldKey(field.key);
+  try {
+    await context.client.command({
+      query: `ALTER TABLE data.${safePhysicalName}
+MODIFY COLUMN \`${safeFieldKey}\` ${expectedType}`,
+    });
+    context.repository.clearCache();
+    context.fixed += 1;
+    context.logger.info(
+      {
+        operation: 'reconcile_modify_column_type',
+        projectId: table.projectId,
+        physicalName: table.physicalName,
+        fieldKey: field.key,
+        actualType,
+        expectedType,
+      },
+      'reconciled lossless String and LowCardinality(String) type drift',
+    );
+  } catch (error) {
+    context.failed += 1;
+    context.logger.error(
+      {
+        operation: 'reconcile_modify_column_type',
+        projectId: table.projectId,
+        physicalName: table.physicalName,
+        fieldKey: field.key,
+        actualType,
+        expectedType,
+        err: error,
+      },
+      'failed to reconcile lossless physical column type drift',
+    );
+  }
+}
+
 async function reconcileTableSchema(context: ReconcileContext, table: TableRecord): Promise<void> {
   let fields: FieldRecord[];
   let physicalColumns: Map<string, string>;
@@ -348,6 +327,36 @@ async function reconcileTableSchema(context: ReconcileContext, table: TableRecor
     if (field.status === 'active' && !physicalColumns.has(field.key)) {
       await repairMissingColumn(context, table, field);
     }
+  }
+
+  for (const field of fields) {
+    if (field.status !== 'active') {
+      continue;
+    }
+    const actualType = physicalColumns.get(field.key);
+    if (actualType === undefined) {
+      continue;
+    }
+    const expectedType = physicalTypeFor(field.type);
+    if (actualType === expectedType) {
+      continue;
+    }
+    if (isLosslessTextEncodingDrift(actualType, expectedType)) {
+      await repairPhysicalType(context, table, field, actualType, expectedType);
+      continue;
+    }
+    context.logger.warn(
+      {
+        operation: 'reconcile_column_type_mismatch',
+        projectId: table.projectId,
+        physicalName: table.physicalName,
+        fieldKey: field.key,
+        metadataType: field.type,
+        actualType,
+        expectedType,
+      },
+      'physical column type differs from field metadata; leaving it unchanged',
+    );
   }
 
   for (const fieldKey of physicalColumns.keys()) {

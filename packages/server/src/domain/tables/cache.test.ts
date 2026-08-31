@@ -24,6 +24,7 @@ function definition(status: TableDefinition['status'] = 'active'): TableDefiniti
         type: 'string',
         required: true,
         description: '',
+        activeOptions: new Map(),
         schemaVersion: 1,
       },
     ],

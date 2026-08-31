@@ -5,9 +5,21 @@ import { AppError } from '../../errors.js';
 import { requireRole } from '../auth/jwt.js';
 import type { TableRepository } from './repository.js';
 import { assertValidFieldKey } from './schema.js';
-import { FIELD_TYPES, TABLE_STATUSES, toPublicTable, type TableRecord } from './types.js';
+import {
+  FIELD_OPTION_STATUSES,
+  FIELD_TYPES,
+  TABLE_STATUSES,
+  toPublicTable,
+  type TableRecord,
+} from './types.js';
 
 const projectIdPattern = /^prj_[0-9A-HJKMNP-TV-Z]{26}$/;
+
+const fieldOptionSchema = z.object({
+  value: z.string(),
+  label: z.string(),
+  status: z.enum(FIELD_OPTION_STATUSES).default('active'),
+});
 
 const fieldSchema = z.object({
   key: z.string(),
@@ -15,6 +27,7 @@ const fieldSchema = z.object({
   type: z.enum(FIELD_TYPES),
   required: z.boolean(),
   description: z.string().default(''),
+  options: z.array(fieldOptionSchema).optional(),
 });
 
 const createTableSchema = z.object({
@@ -40,6 +53,15 @@ const updateFieldSchema = z
 
 const renameFieldSchema = z.object({
   key: z.string(),
+});
+
+const updateFieldOptionsSchema = z.object({
+  options: z.array(fieldOptionSchema),
+});
+
+const retypeFieldSchema = z.object({
+  type: z.enum(FIELD_TYPES),
+  options: z.array(fieldOptionSchema).optional(),
 });
 
 const confirmationSchema = z
@@ -106,6 +128,20 @@ function logTableDeletion(request: FastifyRequest, table: TableRecord): void {
   );
 }
 
+// 明文上报密钥的唯一读取出口，没有它就无法从结构化日志追溯密钥泄漏来源。
+function logSecretRead(request: FastifyRequest, table: TableRecord): void {
+  request.log.info(
+    {
+      requestId: request.id,
+      operator: request.user.username,
+      projectId: table.projectId,
+      operation: 'read_table_secret',
+      schemaVersion: table.schemaVersion,
+    },
+    'collection table ingest secret read',
+  );
+}
+
 function secretResponse(table: TableRecord): {
   projectId: string;
   ingestSecret: string;
@@ -145,11 +181,14 @@ export function registerTableRoutes(app: FastifyInstance, repository: TableRepos
     { preHandler: requireRole('user', 'admin', 'super_admin') },
     async (request) => {
       const projectId = parseProjectId(request.params);
-      const definition = await repository.getDefinition(projectId);
-      if (definition === null) {
+      const [table, fields] = await Promise.all([
+        repository.findById(projectId),
+        repository.listFields(projectId),
+      ]);
+      if (table === null) {
         throw new AppError('TABLE_NOT_FOUND', `Table "${projectId}" was not found`);
       }
-      return { table: toPublicTable(definition), fields: definition.fields };
+      return { table: toPublicTable(table), fields };
     },
   );
 
@@ -203,7 +242,11 @@ export function registerTableRoutes(app: FastifyInstance, repository: TableRepos
   app.get(
     '/api/admin/tables/:projectId/secret',
     { preHandler: requireRole('admin', 'super_admin') },
-    async (request) => secretResponse(await repository.getSecret(parseProjectId(request.params))),
+    async (request) => {
+      const table = await repository.getSecret(parseProjectId(request.params));
+      logSecretRead(request, table);
+      return secretResponse(table);
+    },
   );
 
   app.post(
@@ -255,6 +298,37 @@ export function registerTableRoutes(app: FastifyInstance, repository: TableRepos
         table: toPublicTable(changed.table),
         field: changed.field,
         message: '前端上报代码需同步改用新 Key，否则旧 Key 的上报会被拒绝',
+      };
+    },
+  );
+
+  app.put(
+    '/api/admin/tables/:projectId/fields/:fieldKey/options',
+    { preHandler: requireRole('admin', 'super_admin') },
+    async (request) => {
+      const { projectId, fieldKey } = parseFieldParams(request.params);
+      const body = parseInput(updateFieldOptionsSchema, request.body);
+      const changed = await repository.updateFieldOptions(projectId, fieldKey, body.options);
+      logTableChange(request, 'update_field_options', changed.table);
+      return { table: toPublicTable(changed.table), field: changed.field };
+    },
+  );
+
+  app.post(
+    '/api/admin/tables/:projectId/fields/:fieldKey/retype',
+    { preHandler: requireRole('admin', 'super_admin') },
+    async (request) => {
+      const { projectId, fieldKey } = parseFieldParams(request.params);
+      const body = parseInput(retypeFieldSchema, request.body);
+      const changed = await repository.retypeField(projectId, fieldKey, body);
+      logTableChange(request, 'retype_field', changed.table);
+      return {
+        table: toPublicTable(changed.table),
+        field: changed.field,
+        message:
+          body.type === 'enum'
+            ? '历史数据中不在选项内的值仍可查询与分组，但新上报会被拒绝，请先确认前端发的值都已登记'
+            : '字段已转换为文本，历史数据完整保留，新的上报不再受枚举选项限制',
       };
     },
   );

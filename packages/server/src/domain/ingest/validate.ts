@@ -10,7 +10,7 @@ export interface IngestPayload {
   data: Record<string, unknown>;
 }
 
-export type ValidatedFieldValues = Record<string, string | boolean | null>;
+export type ValidatedFieldValues = Record<string, string | number | boolean | null>;
 
 // DESIGN 8.2 第 6 步只要求「合法 UUID」，不限版本：调用方可能用 v1 / v7 生成稳定的 recordId，
 // 物理列是 ClickHouse 的 UUID 类型，同样不区分版本。
@@ -20,15 +20,149 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+function matchesFieldType(value: unknown, fieldType: ActiveField['type']): boolean {
+  if (fieldType === 'string' || fieldType === 'enum') {
+    return typeof value === 'string';
+  }
+  if (fieldType === 'boolean') {
+    return typeof value === 'boolean';
+  }
+  return typeof value === 'number';
+}
+
 function expectedField(
-  field: Pick<ActiveField | FieldRecord, 'key' | 'label' | 'type' | 'required'>,
+  field: Pick<ActiveField | FieldRecord, 'key' | 'label' | 'type' | 'required'> & {
+    activeOptions?: ReadonlyMap<string, string>;
+  },
+  maxEnumOptions: number,
 ): ExpectedField {
-  return {
+  const expected: ExpectedField = {
     key: field.key,
     label: field.label,
     type: field.type,
     required: field.required,
   };
+  if (field.type === 'enum') {
+    const activeOptions = field.activeOptions ?? new Map<string, string>();
+    expected.options = [...activeOptions.keys()].slice(0, maxEnumOptions);
+  }
+  return expected;
+}
+
+interface SubmittedFieldValue {
+  field: ActiveField;
+  value: unknown;
+}
+
+function validateFieldTypes(
+  submitted: readonly SubmittedFieldValue[],
+  schemaVersion: number,
+  schemaLimits: Limits['schema'],
+): void {
+  for (const { field, value } of submitted) {
+    if (!matchesFieldType(value, field.type)) {
+      const message = `Field "${field.key}" expects ${field.type}, got ${String(value)}`;
+      throw new AppError('INVALID_FIELD_TYPE', message, {
+        field: field.key,
+        expected: expectedField(field, schemaLimits.maxEnumOptions),
+        schemaVersion,
+      });
+    }
+  }
+}
+
+function invalidFieldValue(
+  field: ActiveField,
+  message: string,
+  schemaVersion: number,
+  schemaLimits: Limits['schema'],
+): never {
+  throw new AppError('INVALID_FIELD_VALUE', message, {
+    field: field.key,
+    expected: expectedField(field, schemaLimits.maxEnumOptions),
+    schemaVersion,
+  });
+}
+
+function validateFieldValueDomains(
+  submitted: readonly SubmittedFieldValue[],
+  schemaVersion: number,
+  ingestLimits: Limits['ingest'],
+  schemaLimits: Limits['schema'],
+): void {
+  for (const { field, value } of submitted) {
+    if (field.type === 'string') {
+      const stringValue = value as string;
+      if (Buffer.byteLength(stringValue, 'utf8') > ingestLimits.maxStringLength) {
+        throw new AppError(
+          'FIELD_VALUE_TOO_LONG',
+          `Field "${field.key}" exceeds ${ingestLimits.maxStringLength} UTF-8 bytes`,
+          {
+            field: field.key,
+            expected: expectedField(field, schemaLimits.maxEnumOptions),
+            schemaVersion,
+          },
+        );
+      }
+      continue;
+    }
+
+    if (field.type === 'enum') {
+      const stringValue = value as string;
+      if (!field.activeOptions.has(stringValue)) {
+        const remaining = Math.max(0, field.activeOptions.size - schemaLimits.maxEnumOptions);
+        const truncated = remaining === 0 ? '' : `; expected.options omits ${remaining} more`;
+        invalidFieldValue(
+          field,
+          `Field "${field.key}" expects one of the registered active options, got ${JSON.stringify(stringValue)}${truncated}`,
+          schemaVersion,
+          schemaLimits,
+        );
+      }
+      continue;
+    }
+
+    if (field.type === 'integer') {
+      const numberValue = value as number;
+      if (!Number.isInteger(numberValue) || Math.abs(numberValue) > Number.MAX_SAFE_INTEGER) {
+        invalidFieldValue(
+          field,
+          `Field "${field.key}" must be an integer between ${Number.MIN_SAFE_INTEGER} and ${Number.MAX_SAFE_INTEGER}`,
+          schemaVersion,
+          schemaLimits,
+        );
+      }
+      continue;
+    }
+
+    if (field.type === 'float') {
+      if (!Number.isFinite(value as number)) {
+        invalidFieldValue(
+          field,
+          `Field "${field.key}" must be a finite number`,
+          schemaVersion,
+          schemaLimits,
+        );
+      }
+      continue;
+    }
+
+    if (field.type === 'datetime') {
+      const numberValue = value as number;
+      if (
+        !Number.isInteger(numberValue) ||
+        numberValue < ingestLimits.datetimeMinMs ||
+        numberValue > ingestLimits.datetimeMaxMs
+      ) {
+        invalidFieldValue(
+          field,
+          `Field "${field.key}" must be an integer millisecond timestamp between ${ingestLimits.datetimeMinMs} and ${ingestLimits.datetimeMaxMs}`,
+          schemaVersion,
+          schemaLimits,
+        );
+      }
+    }
+  }
 }
 
 export function parsePayload(
@@ -90,6 +224,7 @@ export async function validateFieldValues(
   definition: Pick<TableDefinition, 'projectId' | 'schemaVersion' | 'fields'>,
   listFields: (projectId: string) => Promise<FieldRecord[]>,
   ingestLimits: Limits['ingest'],
+  schemaLimits: Limits['schema'],
 ): Promise<ValidatedFieldValues> {
   const activeByKey = new Map(definition.fields.map((field) => [field.key, field]));
   const unknownKeys = Object.keys(data).filter(
@@ -107,7 +242,7 @@ export async function validateFieldValues(
     if (retired?.status === 'deprecated') {
       throw new AppError('DEPRECATED_FIELD', `Field "${fieldKey}" is deprecated`, {
         field: fieldKey,
-        expected: expectedField(retired),
+        expected: expectedField(retired, schemaLimits.maxEnumOptions),
         schemaVersion: definition.schemaVersion,
       });
     }
@@ -119,48 +254,28 @@ export async function validateFieldValues(
   }
 
   const values: ValidatedFieldValues = {};
+  const submitted: SubmittedFieldValue[] = [];
   for (const field of definition.fields) {
     const value = Object.hasOwn(data, field.key) ? data[field.key] : undefined;
     if (value === null || value === undefined) {
       if (field.required) {
         throw new AppError('REQUIRED_FIELD_MISSING', `Required field "${field.key}" is missing`, {
           field: field.key,
-          expected: expectedField(field),
+          expected: expectedField(field, schemaLimits.maxEnumOptions),
           schemaVersion: definition.schemaVersion,
         });
       }
       values[field.key] = null;
       continue;
     }
+    submitted.push({ field, value });
+  }
 
-    if (typeof value !== field.type) {
-      throw new AppError(
-        'INVALID_FIELD_TYPE',
-        `Field "${field.key}" expects ${field.type}, got ${typeof value}`,
-        {
-          field: field.key,
-          expected: expectedField(field),
-          schemaVersion: definition.schemaVersion,
-        },
-      );
-    }
-    if (
-      field.type === 'string' &&
-      typeof value === 'string' &&
-      Buffer.byteLength(value, 'utf8') > ingestLimits.maxStringLength
-    ) {
-      throw new AppError(
-        'FIELD_VALUE_TOO_LONG',
-        `Field "${field.key}" exceeds ${ingestLimits.maxStringLength} UTF-8 bytes`,
-        {
-          field: field.key,
-          expected: expectedField(field),
-          schemaVersion: definition.schemaVersion,
-        },
-      );
-    }
+  validateFieldTypes(submitted, definition.schemaVersion, schemaLimits);
+  validateFieldValueDomains(submitted, definition.schemaVersion, ingestLimits, schemaLimits);
 
-    values[field.key] = value as string | boolean;
+  for (const { field, value } of submitted) {
+    values[field.key] = value as string | number | boolean;
   }
   return values;
 }

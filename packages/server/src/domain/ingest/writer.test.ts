@@ -10,6 +10,7 @@ const fields: ActiveField[] = [
     type: 'string',
     required: true,
     description: '',
+    activeOptions: new Map(),
     schemaVersion: 7,
   },
   {
@@ -18,6 +19,7 @@ const fields: ActiveField[] = [
     type: 'boolean',
     required: false,
     description: '',
+    activeOptions: new Map(),
     schemaVersion: 7,
   },
 ];

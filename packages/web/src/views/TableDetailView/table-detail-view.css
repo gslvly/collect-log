@@ -1,0 +1,411 @@
+.detail-page {
+  display: grid;
+  gap: 18px;
+}
+
+.state-card,
+.detail-card {
+  border-color: #e5ebf3;
+  border-radius: 14px;
+}
+
+.detail-heading,
+.title-row,
+.card-heading,
+.code-heading,
+.fields-toolbar,
+.status-panel,
+.danger-zone,
+.copy-value,
+.secret-value,
+.history-control {
+  display: flex;
+  align-items: center;
+}
+
+.detail-heading,
+.card-heading,
+.code-heading,
+.fields-toolbar,
+.status-panel,
+.danger-zone {
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.section-eyebrow {
+  margin: 0 0 6px;
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: 0.14em;
+  color: #2d70d6;
+}
+
+.title-row {
+  gap: 12px;
+}
+
+.detail-heading h2,
+.detail-heading p,
+.fields-toolbar h3,
+.fields-toolbar p,
+.status-panel h3,
+.status-panel p,
+.danger-zone h3,
+.danger-zone p,
+.card-heading h3,
+.card-heading p,
+.code-heading h3,
+.code-heading p {
+  margin: 0;
+}
+
+.detail-heading h2 {
+  font-size: 26px;
+  letter-spacing: -0.02em;
+}
+
+.detail-heading > div > p:last-child,
+.fields-toolbar p,
+.status-panel p,
+.danger-zone p,
+.card-heading p,
+.code-heading p {
+  margin-top: 6px;
+  font-size: 13px;
+  color: #7d899b;
+}
+
+.detail-card :deep(.el-card__body) {
+  padding-top: 8px;
+}
+
+.tab-section {
+  display: grid;
+  padding: 12px 4px 8px;
+  gap: 20px;
+}
+
+.copy-value,
+.secret-value,
+.history-control,
+.status-actions {
+  gap: 10px;
+}
+
+.copy-value code,
+.secret-value code,
+.fields-table code,
+.confirmation-details code {
+  font-size: 12px;
+  color: #48566b;
+  background: #f2f5f9;
+  border-radius: 4px;
+}
+
+.copy-value code,
+.secret-value code {
+  padding: 5px 8px;
+}
+
+.status-panel,
+.danger-zone {
+  padding: 18px;
+  background: #f8fafc;
+  border: 1px solid #e5eaf1;
+  border-radius: 10px;
+}
+
+.recent-panel {
+  display: grid;
+  padding: 18px;
+  gap: 16px;
+  border: 1px solid #e5eaf1;
+  border-radius: 10px;
+}
+
+.recent-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.recent-heading h3,
+.recent-heading p {
+  margin: 0;
+}
+
+.recent-heading p {
+  margin-top: 6px;
+  font-size: 13px;
+  color: #7d899b;
+}
+
+.recent-table {
+  width: 100%;
+}
+
+.recent-column-heading {
+  display: grid;
+  gap: 3px;
+}
+
+.recent-column-heading code {
+  width: fit-content;
+  padding: 1px 4px;
+  font-size: 11px;
+  font-weight: 400;
+  color: #65758b;
+  background: #f1f4f8;
+  border-radius: 4px;
+}
+
+.recent-unset {
+  display: inline-block;
+  padding: 2px 7px;
+  font-size: 12px;
+  color: #9a6a2f;
+  background: #fff6e8;
+  border: 1px dashed #e6bd84;
+  border-radius: 5px;
+}
+
+.recent-empty-string {
+  display: inline-block;
+  padding: 2px 7px;
+  font-size: 12px;
+  color: #718096;
+  background: #f2f5f8;
+  border-radius: 5px;
+}
+
+.danger-zone {
+  background: #fff8f8;
+  border-color: #f5c7c7;
+}
+
+.history-control small {
+  color: #8a95a5;
+}
+
+.fields-table {
+  width: 100%;
+}
+
+.type-lock-note {
+  max-width: 175px;
+  margin: 4px 0 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: #8b96a7;
+}
+
+.renamed-target {
+  margin: 5px 0 0;
+  font-size: 12px;
+  color: #7d899b;
+}
+
+.no-action {
+  color: #a8b0bc;
+}
+
+.danger-menu-item {
+  color: #f56c6c;
+}
+
+.integration-section {
+  gap: 24px;
+}
+
+.secret-card {
+  border-color: #e5eaf1;
+}
+
+.secret-value code {
+  min-width: min(460px, 70vw);
+  overflow-wrap: anywhere;
+}
+
+.code-section {
+  display: grid;
+  gap: 12px;
+}
+
+pre {
+  max-height: 620px;
+  padding: 18px;
+  margin: 0;
+  overflow: auto;
+  font-size: 12px;
+  line-height: 1.65;
+  color: #d9e2f2;
+  background: #172033;
+  border-radius: 10px;
+}
+
+.dialog-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+.field-label-with-help {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.field-help-icon {
+  cursor: help;
+  color: #7d899b;
+  outline: none;
+}
+
+.field-help-icon:hover,
+.field-help-icon:focus-visible {
+  color: #2d70d6;
+}
+
+.field-help-icon:focus-visible {
+  border-radius: 50%;
+  box-shadow: 0 0 0 2px #cfe0fb;
+}
+
+.field-type-control {
+  display: grid;
+  width: 100%;
+  gap: 6px;
+}
+
+.field-type-notice {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #6f7c8f;
+}
+
+.field-type-option {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  min-width: 360px;
+  gap: 18px;
+}
+
+.field-type-option span {
+  font-size: 12px;
+  color: #7c899b;
+}
+
+.custom-dialog-stack {
+  display: grid;
+  gap: 16px;
+}
+
+.top-values-panel,
+.enum-release-summary {
+  display: grid;
+  padding: 14px;
+  background: #fbfcfe;
+  border: 1px solid #e3e9f1;
+  border-radius: 10px;
+  gap: 12px;
+}
+
+.top-values-panel > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.top-values-panel p,
+.enum-release-summary p {
+  margin: 4px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #758399;
+}
+
+.top-value-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  max-height: 220px;
+  overflow-y: auto;
+  border-top: 1px solid #e7ecf3;
+}
+
+.top-value-row {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  align-items: center;
+  min-height: 42px;
+  padding: 0 10px;
+  border-bottom: 1px solid #edf1f6;
+  gap: 8px;
+}
+
+.top-value-row code {
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.top-value-row span {
+  font-size: 12px;
+  color: #7e8a9c;
+}
+
+.released-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.confirmation-details {
+  margin-top: 16px;
+}
+
+.count-error {
+  color: #f56c6c;
+}
+
+.consequences {
+  padding-left: 22px;
+  line-height: 1.8;
+  color: #c45656;
+}
+
+.count-note {
+  font-size: 12px;
+  color: #7d899b;
+}
+
+@media (max-width: 780px) {
+  .detail-heading,
+  .card-heading,
+  .code-heading,
+  .fields-toolbar,
+  .status-panel,
+  .recent-heading,
+  .danger-zone {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .status-actions {
+    display: flex;
+    flex-wrap: wrap;
+  }
+
+  .dialog-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .top-value-list {
+    grid-template-columns: 1fr;
+  }
+}
